@@ -1,0 +1,14 @@
+# Core Computer Vision & Numerical processing
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# Detection & AI Libraries
+ultralytics>=8.0.0
+
+# For inference on PC (TensorFlow includes TFLite runtime):
+tensorflow>=2.11.0
+
+# On Raspberry Pi (Raspberry Pi OS 64-bit), you can install lightweight tflite-runtime instead of full tensorflow:
+# pip install tflite-runtime
+# Picamera2 is pre-installed on Raspberry Pi OS Bookworm/Bullseye or via:
+# sudo apt install python3-picamera2
