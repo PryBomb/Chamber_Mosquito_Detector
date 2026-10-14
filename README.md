@@ -67,19 +67,34 @@ Chamber_Mosquito_Detector/
 
 ## 🚀 Installation & Running
 
-### On Raspberry Pi (Raspberry Pi OS 64-bit Bookworm / Bullseye)
+### On Raspberry Pi (Debian Trixie / Bookworm / Bullseye)
 
-1. Open terminal and update packages:
+> [!NOTE]
+> On **Debian Trixie (Python 3.13)**, the legacy `tflite-runtime` is deprecated and has no pre-built wheels. The project now provides seamless multi-backend support for **`ai-edge-litert`** (Google's official successor) and **`onnxruntime`** (with pre-built [`models/mosquito_model.onnx`](models/mosquito_model.onnx)).
+
+1. Ensure camera and vision system packages are installed:
    ```bash
    sudo apt update && sudo apt install -y python3-picamera2 python3-opencv python3-numpy
    ```
 
-2. Install lightweight TFLite runtime and Ultralytics:
+2. Create a virtual environment that uses the system packages (recommended for Debian PEP 668):
    ```bash
-   pip3 install tflite-runtime ultralytics
+   python3 -m venv --system-site-packages env
+   source env/bin/activate
    ```
 
-3. Launch the detector:
+3. Install the runtime and YOLO detector:
+   - **Option A (Google LiteRT - Official TFLite successor)**:
+     ```bash
+     pip install ai-edge-litert ultralytics
+     ```
+   - **Option B (ONNX Runtime - Universal Python 3.13 ARM64 wheel)**:
+     ```bash
+     pip install onnxruntime ultralytics
+     ```
+   *(Or without venv using `pip install --break-system-packages onnxruntime ultralytics`)*
+
+4. Launch the detector:
    ```bash
    python3 chamber_detector.py
    ```

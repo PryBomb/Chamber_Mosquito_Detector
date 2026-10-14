@@ -12,6 +12,7 @@ os.makedirs(CAPTURES_DIR, exist_ok=True)
 
 # Model paths
 TFLITE_MODEL_PATH = os.path.join(MODELS_DIR, "mosquito_model.tflite")
+ONNX_MODEL_PATH = os.path.join(MODELS_DIR, "mosquito_model.onnx")
 PKL_MODEL_PATH = os.path.join(MODELS_DIR, "mosquito_model.pkl")
 YOLO_MODEL_PATH = "yolov8n.pt"  # Will automatically download on first run
 

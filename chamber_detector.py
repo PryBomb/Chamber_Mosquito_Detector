@@ -78,34 +78,80 @@ class ChamberCamera:
             self.cap.release()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Stage 2 Classifier (TFLite Model)
+# 2. Stage 2 Classifier (LiteRT / ONNX / TFLite Multi-Backend)
 # ─────────────────────────────────────────────────────────────────────────────
 class MosquitoClassifier:
-    def __init__(self, model_path=config.TFLITE_MODEL_PATH):
-        self.model_path = model_path
-        self.interpreter = None
-        self.input_details = None
-        self.output_details = None
+    def __init__(self, tflite_path=config.TFLITE_MODEL_PATH, onnx_path=config.ONNX_MODEL_PATH):
+        self.tflite_path = tflite_path
+        self.onnx_path = onnx_path
         self.classes = config.SPECIES_CLASSES
+        self.backend = None
+        self.interpreter = None
+        self.session = None
 
-        if not os.path.exists(self.model_path):
-            raise FileNotFoundError(f"Model file '{self.model_path}' not found!")
+        # 1. Try modern Google LiteRT (Official TFLite successor; supports Python 3.12 / 3.13)
+        if os.path.exists(self.tflite_path):
+            with open(self.tflite_path, 'rb') as f:
+                model_content = f.read()
 
-        with open(self.model_path, 'rb') as f:
-            model_content = f.read()
+            try:
+                from ai_edge_litert.interpreter import Interpreter
+                self.interpreter = Interpreter(model_content=model_content)
+                self.interpreter.allocate_tensors()
+                self.input_details = self.interpreter.get_input_details()
+                self.output_details = self.interpreter.get_output_details()
+                self.backend = "litert"
+                print(f"[INFO] Classifier loaded via Google AI Edge LiteRT: {os.path.basename(self.tflite_path)}")
+                return
+            except ImportError:
+                pass
 
-        # Try lightweight tflite_runtime first (Raspberry Pi preferred)
-        try:
-            from tflite_runtime.interpreter import Interpreter
-            self.interpreter = Interpreter(model_content=model_content)
-        except ImportError:
-            from tensorflow.lite.python.interpreter import Interpreter
-            self.interpreter = Interpreter(model_content=model_content)
+            # 2. Try legacy tflite_runtime (for Python <= 3.11)
+            try:
+                from tflite_runtime.interpreter import Interpreter
+                self.interpreter = Interpreter(model_content=model_content)
+                self.interpreter.allocate_tensors()
+                self.input_details = self.interpreter.get_input_details()
+                self.output_details = self.interpreter.get_output_details()
+                self.backend = "tflite_runtime"
+                print(f"[INFO] Classifier loaded via tflite-runtime: {os.path.basename(self.tflite_path)}")
+                return
+            except ImportError:
+                pass
 
-        self.interpreter.allocate_tensors()
-        self.input_details = self.interpreter.get_input_details()
-        self.output_details = self.interpreter.get_output_details()
-        print(f"[INFO] Classifier loaded: {os.path.basename(self.model_path)}")
+        # 3. Try ONNX Runtime (official pre-built wheels for Python 3.13 on aarch64 / ARM64)
+        if os.path.exists(self.onnx_path):
+            try:
+                import onnxruntime as ort
+                self.session = ort.InferenceSession(self.onnx_path, providers=['CPUExecutionProvider'])
+                self.onnx_input_name = self.session.get_inputs()[0].name
+                self.backend = "onnx"
+                print(f"[INFO] Classifier loaded via ONNX Runtime: {os.path.basename(self.onnx_path)}")
+                return
+            except ImportError:
+                pass
+
+        # 4. Fallback to full TensorFlow Lite (PC / Development)
+        if os.path.exists(self.tflite_path):
+            try:
+                from tensorflow.lite.python.interpreter import Interpreter
+                self.interpreter = Interpreter(model_content=model_content)
+                self.interpreter.allocate_tensors()
+                self.input_details = self.interpreter.get_input_details()
+                self.output_details = self.interpreter.get_output_details()
+                self.backend = "tensorflow"
+                print(f"[INFO] Classifier loaded via TensorFlow Lite: {os.path.basename(self.tflite_path)}")
+                return
+            except ImportError:
+                pass
+
+        raise RuntimeError(
+            "Could not load any AI inference backend for mosquito classifier!\n"
+            "On Python 3.13 (Debian Trixie / Raspberry Pi), install either:\n"
+            "  pip install ai-edge-litert\n"
+            "or\n"
+            "  pip install onnxruntime"
+        )
 
     def classify_crop(self, bgr_crop):
         """
@@ -115,9 +161,15 @@ class MosquitoClassifier:
         img_resized = cv2.resize(bgr_crop, (64, 64))
         img_normalized = (img_resized.astype(np.float32) / 255.0).reshape(1, 64, 64, 3)
 
-        self.interpreter.set_tensor(self.input_details[0]['index'], img_normalized)
-        self.interpreter.invoke()
-        output = self.interpreter.get_tensor(self.output_details[0]['index'])[0]
+        if self.backend in ["litert", "tflite_runtime", "tensorflow"]:
+            self.interpreter.set_tensor(self.input_details[0]['index'], img_normalized)
+            self.interpreter.invoke()
+            output = self.interpreter.get_tensor(self.output_details[0]['index'])[0]
+        elif self.backend == "onnx":
+            outputs = self.session.run(None, {self.onnx_input_name: img_normalized})
+            output = outputs[0][0]
+        else:
+            raise RuntimeError("Classifier backend not initialized.")
 
         class_idx = int(np.argmax(output))
         confidence = float(output[class_idx])

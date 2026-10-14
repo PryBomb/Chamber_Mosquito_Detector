@@ -8,7 +8,12 @@ ultralytics>=8.0.0
 # For inference on PC (TensorFlow includes TFLite runtime):
 tensorflow>=2.11.0
 
-# On Raspberry Pi (Raspberry Pi OS 64-bit), you can install lightweight tflite-runtime instead of full tensorflow:
-# pip install tflite-runtime
-# Picamera2 is pre-installed on Raspberry Pi OS Bookworm/Bullseye or via:
-# sudo apt install python3-picamera2
+# Raspberry Pi Runtime Options:
+# On Debian Trixie (Python 3.13), legacy tflite-runtime has NO wheels.
+# Use either:
+# 1. ai-edge-litert (Google's official successor to TFLite):
+#    pip install ai-edge-litert
+# 2. OR onnxruntime (pre-built wheels on ARM64 for Python 3.13):
+#    pip install onnxruntime
+# 3. Ultralytics for YOLO:
+#    pip install ultralytics
