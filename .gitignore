@@ -1,0 +1,26 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Runtime outputs & logs
+evaluation_results/
+detection_log.csv
+captures/*
+!captures/.gitkeep
+
+# Auto-downloaded model weights
+yolov8n.pt
+*.pt
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

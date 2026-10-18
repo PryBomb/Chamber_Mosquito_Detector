@@ -16,8 +16,15 @@ ONNX_MODEL_PATH = os.path.join(MODELS_DIR, "mosquito_model.onnx")
 PKL_MODEL_PATH = os.path.join(MODELS_DIR, "mosquito_model.pkl")
 YOLO_MODEL_PATH = "yolov8n.pt"  # Will automatically download on first run
 
-# Class labels for the 2nd-stage classifier
+# Class labels for the 2nd-stage classifier (matches mosquito_model.tflite training)
 SPECIES_CLASSES = ["Aedes aegypti", "Aedes albopictus"]
+
+# Chamber Region of Interest (ROI) Settings
+# Trims outer edges (silicone glue seams and purple sidewalls) to achieve 0 false positives
+USE_CHAMBER_ROI = True
+ROI_MARGIN_X = 0.08  # 8% margin from left and right edges
+ROI_MARGIN_Y = 0.05  # 5% margin from top and bottom edges
+SHOW_ROI_OVERLAY = True  # Draw ROI boundary on the preview stream
 
 # Camera Configuration
 # Raspberry Pi HQ Camera native modes:

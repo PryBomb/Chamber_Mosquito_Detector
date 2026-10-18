@@ -120,9 +120,14 @@ Chamber_Mosquito_Detector/
      ```powershell
      python chamber_detector.py --source "path/to/mosquito_test.mp4"
      ```
-   - Force ultra-fast white-chamber contrast mode instead of YOLO:
+   - Run live playback simulation over your chamber dataset folder:
      ```powershell
-     python chamber_detector.py --mode chamber_contrast
+     python chamber_detector.py --source "C:\Users\LAPTOP\Downloads\Chamber_Dataset"
+     ```
+   - Run batch benchmark & false-positive evaluation across all dataset images:
+     ```powershell
+     python evaluate_dataset.py --dir "C:\Users\LAPTOP\Downloads\Chamber_Dataset" --mode chamber_contrast
+     python evaluate_dataset.py --dir "C:\Users\LAPTOP\Downloads\Chamber_Dataset" --mode yolo
      ```
 
 ---

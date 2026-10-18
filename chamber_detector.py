@@ -9,6 +9,14 @@ import numpy as np
 
 import config
 
+# Ensure console output handles non-ASCII folder paths safely on Windows
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Camera Abstraction (Picamera2 for Pi HQ Camera, OpenCV VideoCapture fallback)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -20,8 +28,29 @@ class ChamberCamera:
         self.is_picam2 = False
         self.cap = None
 
-        # If a specific source is given (e.g. camera index or video file)
+        # If a specific source is given (e.g. folder of images, single image, camera index, or video file)
         if source is not None:
+            # Check if source is a folder of images
+            if isinstance(source, str) and os.path.isdir(source):
+                import glob
+                extensions = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
+                self.img_files = []
+                for ext in extensions:
+                    self.img_files.extend(glob.glob(os.path.join(source, ext)))
+                self.img_files = sorted(self.img_files)
+                self.img_idx = 0
+                self.is_image_folder = True
+                print(f"[INFO] Initialized image dataset stream from: {source} ({len(self.img_files)} images)")
+                return
+
+            # Check if source is a single image file
+            if isinstance(source, str) and os.path.isfile(source) and source.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+                self.img_files = [source]
+                self.img_idx = 0
+                self.is_image_folder = True
+                print(f"[INFO] Initialized single image input: {source}")
+                return
+
             # Check if source is a digit string (e.g. "0" -> 0)
             if isinstance(source, str) and source.isdigit():
                 source = int(source)
@@ -62,6 +91,25 @@ class ChamberCamera:
 
     def read_frame(self):
         """Returns BGR frame for OpenCV processing, or None on failure."""
+        if getattr(self, 'is_image_folder', False):
+            if not self.img_files:
+                return None
+            if self.img_idx >= len(self.img_files):
+                self.img_idx = 0  # Loop dataset playback
+            path = self.img_files[self.img_idx]
+            self.current_filename = os.path.basename(path)
+            self.img_idx += 1
+            try:
+                frame = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
+            except Exception:
+                frame = cv2.imread(path)
+            if frame is not None:
+                # Resize if needed to match standard chamber resolution
+                fh, fw = frame.shape[:2]
+                if (fw, fh) != (self.width, self.height):
+                    frame = cv2.resize(frame, (self.width, self.height))
+            return frame
+
         if self.is_picam2:
             rgb_frame = self.picam2.capture_array()
             # Convert RGB (Picamera2 default) to BGR for OpenCV
@@ -209,23 +257,36 @@ class ChamberDetector:
     def detect_boxes(self, frame):
         """
         Stage 1: Detect candidate bounding boxes for insects.
+        Respects calibrated Chamber ROI to exclude acrylic wall seams.
         Returns a list of boxes [(x1, y1, x2, y2), ...]
         """
         boxes = []
         h, w, _ = frame.shape
 
+        # Calculate Chamber ROI boundaries
+        if getattr(config, 'USE_CHAMBER_ROI', False):
+            xmin = int(w * config.ROI_MARGIN_X)
+            xmax = int(w * (1.0 - config.ROI_MARGIN_X))
+            ymin = int(h * config.ROI_MARGIN_Y)
+            ymax = int(h * (1.0 - config.ROI_MARGIN_Y))
+            proc_frame = frame[ymin:ymax, xmin:xmax]
+            offset_x, offset_y = xmin, ymin
+        else:
+            proc_frame = frame
+            offset_x, offset_y = 0, 0
+
         if self.mode == "yolo" and self.yolo_model is not None:
-            results = self.yolo_model(frame, conf=config.YOLO_CONF_THRESHOLD, verbose=False)
+            results = self.yolo_model(proc_frame, conf=config.YOLO_CONF_THRESHOLD, verbose=False)
             for r in results:
                 for box in r.boxes.xyxy.cpu().numpy():
                     x1, y1, x2, y2 = map(int, box[:4])
                     area = (x2 - x1) * (y2 - y1)
                     if config.MIN_BBOX_AREA <= area <= config.MAX_BBOX_AREA:
-                        boxes.append((x1, y1, x2, y2))
+                        boxes.append((x1 + offset_x, y1 + offset_y, x2 + offset_x, y2 + offset_y))
         else:
             # Chamber Contrast Detection:
             # In a white chamber, mosquitoes are dark objects with high contrast.
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2GRAY)
             # Threshold to isolate dark objects on white background
             blurred = cv2.GaussianBlur(gray, (5, 5), 0)
             thresh = cv2.adaptiveThreshold(
@@ -245,7 +306,7 @@ class ChamberDetector:
                     # Exclude extreme aspect ratios (lines/scratches)
                     aspect = float(bw) / float(bh)
                     if 0.25 <= aspect <= 4.0:
-                        boxes.append((x, y, x + bw, y + bh))
+                        boxes.append((x + offset_x, y + offset_y, x + bw + offset_x, y + bh + offset_y))
 
         return boxes
 
@@ -346,20 +407,33 @@ class ChamberDetector:
                 cv2.putText(display, label, (x1, max(20, y1 - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
 
+            # Draw Chamber ROI overlay if enabled
+            if getattr(config, 'SHOW_ROI_OVERLAY', False) and getattr(config, 'USE_CHAMBER_ROI', False):
+                rx1 = int(w * config.ROI_MARGIN_X)
+                rx2 = int(w * (1.0 - config.ROI_MARGIN_X))
+                ry1 = int(h * config.ROI_MARGIN_Y)
+                ry2 = int(h * (1.0 - config.ROI_MARGIN_Y))
+                cv2.rectangle(display, (rx1, ry1), (rx2, ry2), (0, 255, 0), 1, cv2.LINE_AA)
+                cv2.putText(display, "CHAMBER ROI ACTIVE", (rx1 + 8, ry1 + 18),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
+
             # Draw HUD bar
             h, w, _ = display.shape
             cv2.rectangle(display, (0, 0), (w, 55), (20, 20, 20), -1)
-            hud_text = f"FPS: {fps:.1f}  |  Mode: {self.mode.upper()}  |  Insects in Chamber: {detected_count}"
-            cv2.putText(display, hud_text, (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+            src_info = f"File: {self.camera.current_filename} | " if getattr(self.camera, 'is_image_folder', False) else ""
+            hud_text = f"{src_info}FPS: {fps:.1f} | Mode: {self.mode.upper()} | Insects: {detected_count}"
+            cv2.putText(display, hud_text, (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA)
 
             # Bottom help line
             cv2.rectangle(display, (0, h - 25), (w, h), (20, 20, 20), -1)
-            cv2.putText(display, "[Q] Quit  |  [S] Save Snapshot  |  [M] Toggle Mode (YOLO / Contrast)",
+            cv2.putText(display, "[Q] Quit  |  [S] Save Snapshot  |  [M] Toggle Mode  |  [SPACE] Pause/Step",
                         (15, h - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
 
             cv2.imshow(window_name, display)
 
-            key = cv2.waitKey(1) & 0xFF
+            # Adjust wait time for image dataset vs live camera
+            delay = 100 if getattr(self.camera, 'is_image_folder', False) else 1
+            key = cv2.waitKey(delay) & 0xFF
             if key == ord('q') or key == 27:
                 break
             elif key == ord('s'):
