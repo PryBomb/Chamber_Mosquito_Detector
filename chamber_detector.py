@@ -284,17 +284,17 @@ class ChamberDetector:
         orig_dark_count = np.count_nonzero(dark_mask)
 
         # Minimum dark pixel threshold (reject microscopic dust/smudges)
-        if orig_dark_count < 80:
+        if orig_dark_count < 40:
             return False, "Too few dark pixels (dust/smudge)"
 
         # 1. Core Thickness / Erosion test:
-        # A screw has a thick solid cylinder core; a mosquito has slender legs and needle body.
+        # A screw has a thick solid cylinder core (retention > 35%); a mosquito has slender legs and needle body (retention < 28%).
         k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         eroded = cv2.erode(dark_mask, k, iterations=3)
         eroded_dark_count = np.count_nonzero(eroded)
         retention = eroded_dark_count / max(orig_dark_count, 1)
 
-        max_retention = getattr(config, 'MAX_CORE_RETENTION', 0.20)
+        max_retention = getattr(config, 'MAX_CORE_RETENTION', 0.32)
         if retention > max_retention:
             return False, f"Solid metal / screw detected (core retention {retention:.1%})"
 
@@ -309,7 +309,7 @@ class ChamberDetector:
         hull_area = cv2.contourArea(hull)
         solidity = area / max(hull_area, 1.0)
 
-        max_solidity = getattr(config, 'MAX_INSECT_SOLIDITY', 0.65)
+        max_solidity = getattr(config, 'MAX_INSECT_SOLIDITY', 0.68)
         if solidity > max_solidity:
             return False, f"Dense solid object (solidity {solidity:.2f})"
 
@@ -344,7 +344,7 @@ class ChamberDetector:
                     proc_frame = frame_to_process
                     offset_x, offset_y = 0, 0
 
-                results = self.yolo_model(proc_frame, conf=config.YOLO_CONF_THRESHOLD, imgsz=getattr(config, 'YOLO_IMGSZ', 224), verbose=False)
+                results = self.yolo_model(proc_frame, conf=config.YOLO_CONF_THRESHOLD, imgsz=getattr(config, 'YOLO_IMGSZ', 512), verbose=False)
                 for r in results:
                     for b in r.boxes:
                         coords = b.xyxy.cpu().numpy()[0]
@@ -442,7 +442,7 @@ class ChamberDetector:
                     hull_area = cv2.contourArea(hull)
                     solidity = area / max(hull_area, 1.0)
                     # Exclude dense solid objects (screws, glue beads) directly in stage 1
-                    if solidity <= getattr(config, 'MAX_INSECT_SOLIDITY', 0.65):
+                    if solidity <= getattr(config, 'MAX_INSECT_SOLIDITY', 0.68):
                         boxes.append((x + offset_x, y + offset_y, x + bw + offset_x, y + bh + offset_y, None, None))
 
         return boxes

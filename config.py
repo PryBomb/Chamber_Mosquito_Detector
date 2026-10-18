@@ -39,9 +39,9 @@ FPS = 30
 # Detection mode: 'yolo' (Accurate AI insect detection) or 'chamber_contrast'
 DETECTION_MODE = "yolo"
 
-# YOLO confidence threshold (0.55 ensures low-confidence noise, screws & smudges are rejected)
-YOLO_CONF_THRESHOLD = 0.55
-YOLO_IMGSZ = 224  # Calibrated 224x224 input size for fast CPU inference (~100ms) with zero UI lag
+# YOLO confidence threshold (0.35 ensures all mosquitoes are detected; morphology rejects screws)
+YOLO_CONF_THRESHOLD = 0.35
+YOLO_IMGSZ = 512  # Optimal resolution (512x512) for capturing small insect features accurately
 YOLO_FRAME_INTERVAL = 1  # Continuous background inference
 
 # Classification confidence threshold (below 80% is labeled 'Uncertain / Non-Target' and suppressed)
@@ -52,10 +52,10 @@ MIN_BBOX_AREA = 250
 MAX_BBOX_AREA = 45000
 
 # Insect Morphology Calibration (Eliminates screws, bolts, and dense non-insects)
-# Mosquitoes have thin legs and slender bodies (solidity < 0.55, core retention < 0.15)
-# Screws and bolts are solid dense metal (solidity > 0.70, core retention > 0.30)
-MAX_INSECT_SOLIDITY = 0.65
-MAX_CORE_RETENTION = 0.20
+# Mosquitoes have thin legs and slender bodies (solidity < 0.65, core retention < 0.28)
+# Screws and bolts are solid dense metal (solidity > 0.70, core retention > 0.35)
+MAX_INSECT_SOLIDITY = 0.68
+MAX_CORE_RETENTION = 0.32
 
 # Live Visual Micro-Tracking (Locks onto moving mosquito at 30 FPS with 0ms delay)
 ENABLE_LIVE_TRACKING = True
