@@ -12,6 +12,7 @@ captures/*
 # Auto-downloaded model weights
 yolov8n.pt
 *.pt
+!models/mosquito_yolo11.pt
 
 # Virtual environments
 .venv/
