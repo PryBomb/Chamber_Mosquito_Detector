@@ -36,8 +36,8 @@ FRAME_HEIGHT = 720
 FPS = 30
 
 # Detection & Classification Parameters
-# Detection mode: 'yolo' (YOLOv8) or 'chamber_contrast' (Fast background contrast for white chamber)
-DETECTION_MODE = "yolo"
+# Detection mode: 'chamber_contrast' (Fast 40+ FPS for white chamber) or 'yolo' (Heavy deep learning)
+DETECTION_MODE = "chamber_contrast"
 
 # YOLO confidence threshold
 YOLO_CONF_THRESHOLD = 0.25
