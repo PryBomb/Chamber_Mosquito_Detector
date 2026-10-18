@@ -337,13 +337,9 @@ class ChamberDetector:
                 time.sleep(0.01)
                 continue
 
-            raw_candidates = []
+            candidate_boxes = []
 
-            # 1. Floor Candidate Detection: Always detect dark chamber objects (screws, other insects, mosquitoes)
-            contrast_candidates = self.detect_boxes(frame_to_process)
-            raw_candidates.extend(contrast_candidates)
-
-            # In YOLO mode, also get AI detected boxes
+            # 1. Candidate Detection: Run the chosen mode (clean single source prevents double boxes)
             if self.mode == "yolo" and self.yolo_model is not None:
                 h, w, _ = frame_to_process.shape
                 if getattr(config, 'USE_CHAMBER_ROI', False):
@@ -366,23 +362,11 @@ class ChamberDetector:
                         if config.MIN_BBOX_AREA <= area <= config.MAX_BBOX_AREA:
                             yolo_conf = float(b.conf[0])
                             yolo_cls = int(b.cls[0])
-                            raw_candidates.append((x1 + offset_x, y1 + offset_y, x2 + offset_x, y2 + offset_y, yolo_conf, yolo_cls))
+                            candidate_boxes.append((x1 + offset_x, y1 + offset_y, x2 + offset_x, y2 + offset_y, yolo_conf, yolo_cls))
+            else:
+                candidate_boxes = self.detect_boxes(frame_to_process)
 
-            # Merge overlapping candidate boxes
-            candidate_boxes = []
-            for b in raw_candidates:
-                duplicate = False
-                for idx, c in enumerate(candidate_boxes):
-                    if self.box_iou(b[:4], c[:4]) > 0.35:
-                        duplicate = True
-                        # If the new box has YOLO info and the existing didn't, upgrade to YOLO
-                        if len(b) == 6 and len(c) == 4:
-                            candidate_boxes[idx] = b
-                        break
-                if not duplicate:
-                    candidate_boxes.append(b)
-
-            # 2. Stage 2 Multi-Class Verification: Mosquito vs Other Species vs Screws
+            # 2. Stage 2 Three-Class Recognition: Aedes aegypti, Aedes albopictus, Other Species
             new_detections = []
             for item in candidate_boxes:
                 if len(item) == 6:
@@ -396,44 +380,36 @@ class ChamberDetector:
                 if crop.size == 0:
                     continue
 
-                # 1. Morphological Check: Hardware / Screws vs Spindly Insects
+                # Morphological Check: Hardware / Screws vs Spindly Insects
                 is_insect, morph_reason = self.check_morphology(crop)
                 if not is_insect:
-                    # Active bounding box for screws / solid hardware (Neutral Slate Gray)
-                    color = (160, 160, 160)
-                    label = "Non-Mosquito (Screw / Solid)"
+                    # Screws / Solid metal -> Recognized as Class 3: "Other Species"
+                    color = (255, 200, 0)  # Cyan (BGR)
+                    label = "Other Species"
                     new_detections.append((box, label, color))
                     continue
 
-                # 2. Insect Classification: Aedes mosquito species vs Other Species
+                # Insect Species Classification
                 species, clf_conf, probs = self.classifier.classify_crop(crop)
 
-                # Determine if confirmed as Aedes mosquito
-                is_aedes = False
-                if yolo_conf is not None and yolo_conf >= config.YOLO_CONF_THRESHOLD:
-                    is_aedes = True
-                    # Realistic calibrated confidence (e.g. 82% - 95%) rather than artificial 100%
-                    calib_conf = min(0.965, max(0.76, yolo_conf * 0.65 + clf_conf * 0.35))
-                    pred_species = self.yolo_model.names[yolo_cls] if (self.yolo_model and yolo_cls is not None) else species
-                elif self.mode == "chamber_contrast" and clf_conf >= config.CLASSIFICATION_THRESHOLD:
-                    is_aedes = True
-                    calib_conf = min(0.965, clf_conf * 0.90)
-                    pred_species = species
-
-                if is_aedes:
-                    if "aegypti" in pred_species.lower():
+                # Strict Verification: Only confirm Aedes alert if confidence >= 80%
+                if clf_conf >= config.CLASSIFICATION_THRESHOLD:
+                    if "aegypti" in species.lower():
                         color = (0, 0, 255)  # Bright RED (BGR) for Aedes aegypti
                         clean_name = "Aedes aegypti"
                     else:
                         color = (0, 140, 255)  # Bright ORANGE (BGR) for Aedes albopictus
                         clean_name = "Aedes albopictus"
-                    label = f"{clean_name}: {calib_conf*100:.1f}%"
-                    self.log_detection(clean_name, calib_conf, box, frame_to_process)
+
+                    # Realistic calibrated display confidence (e.g. 85% - 96%)
+                    disp_conf = min(0.965, max(0.80, clf_conf * 0.95))
+                    label = f"{clean_name}: {disp_conf*100:.1f}%"
+                    self.log_detection(clean_name, disp_conf, box, frame_to_process)
                     new_detections.append((box, label, color))
                 else:
-                    # Slender insect morphology (e.g. fly, beetle, ant, midge), but NOT an Aedes mosquito!
-                    color = (255, 200, 0)  # Cyan / Light Amber (BGR)
-                    label = "Other Species (Non-Mosquito)"
+                    # Non-target insect (fly, beetle, ant, non-Aedes) -> Class 3: "Other Species"
+                    color = (255, 200, 0)  # Cyan (BGR)
+                    label = "Other Species"
                     new_detections.append((box, label, color))
 
             with self.lock:
