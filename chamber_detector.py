@@ -276,7 +276,8 @@ class ChamberDetector:
             offset_x, offset_y = 0, 0
 
         if self.mode == "yolo" and self.yolo_model is not None:
-            results = self.yolo_model(proc_frame, conf=config.YOLO_CONF_THRESHOLD, verbose=False)
+            # Accelerated YOLO for Raspberry Pi (imgsz=320 for 3x speedup)
+            results = self.yolo_model(proc_frame, conf=config.YOLO_CONF_THRESHOLD, imgsz=getattr(config, 'YOLO_IMGSZ', 320), verbose=False)
             for r in results:
                 for box in r.boxes.xyxy.cpu().numpy():
                     x1, y1, x2, y2 = map(int, box[:4])
@@ -285,15 +286,17 @@ class ChamberDetector:
                         boxes.append((x1 + offset_x, y1 + offset_y, x2 + offset_x, y2 + offset_y))
         else:
             # Chamber Contrast Detection:
-            # In a white chamber, mosquitoes are dark objects with high contrast.
+            # Mosquitoes have dark pigment. Transparent glue and light shadows have high luminance.
             gray = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2GRAY)
-            # Threshold to isolate dark objects on white background
-            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            thresh = cv2.adaptiveThreshold(
-                blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY_INV, 25, 10
-            )
-            # Morphological cleaning
+            blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+
+            # Compare against background mean: only pixels significantly darker than the floor are detected
+            mean_val = np.mean(blurred)
+            # Mosquito is at least 35-40 units darker than the white floor
+            dark_thresh = max(40, int(mean_val - 35))
+            _, thresh = cv2.threshold(blurred, dark_thresh, 255, cv2.THRESH_BINARY_INV)
+
+            # Morphological cleaning to eliminate thin scratches and single-pixel dust
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
             cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
             cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -303,9 +306,9 @@ class ChamberDetector:
                 area = cv2.contourArea(cnt)
                 if config.MIN_BBOX_AREA <= area <= config.MAX_BBOX_AREA:
                     x, y, bw, bh = cv2.boundingRect(cnt)
-                    # Exclude extreme aspect ratios (lines/scratches)
+                    # Mosquito bodies are compact or elongated (aspect ratio 0.3 to 3.5), not thin long lines
                     aspect = float(bw) / float(bh)
-                    if 0.25 <= aspect <= 4.0:
+                    if 0.3 <= aspect <= 3.5:
                         boxes.append((x + offset_x, y + offset_y, x + bw + offset_x, y + bh + offset_y))
 
         return boxes

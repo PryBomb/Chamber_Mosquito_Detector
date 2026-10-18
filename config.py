@@ -22,8 +22,8 @@ SPECIES_CLASSES = ["Aedes aegypti", "Aedes albopictus"]
 # Chamber Region of Interest (ROI) Settings
 # Trims outer edges (silicone glue seams and purple sidewalls) to achieve 0 false positives
 USE_CHAMBER_ROI = True
-ROI_MARGIN_X = 0.08  # 8% margin from left and right edges
-ROI_MARGIN_Y = 0.05  # 5% margin from top and bottom edges
+ROI_MARGIN_X = 0.15  # 15% margin from left and right edges (cuts out side walls & glue beads)
+ROI_MARGIN_Y = 0.10  # 10% margin from top and bottom edges
 SHOW_ROI_OVERLAY = True  # Draw ROI boundary on the preview stream
 
 # Camera Configuration
@@ -39,14 +39,16 @@ FPS = 30
 # Detection mode: 'chamber_contrast' (Fast 40+ FPS for white chamber) or 'yolo' (Heavy deep learning)
 DETECTION_MODE = "chamber_contrast"
 
-# YOLO confidence threshold
-YOLO_CONF_THRESHOLD = 0.25
+# YOLO confidence threshold & input image size for fast Pi inference
+YOLO_CONF_THRESHOLD = 0.35
+YOLO_IMGSZ = 320  # Fast inference resolution (320x320) for smooth Raspberry Pi FPS
+YOLO_FRAME_INTERVAL = 3  # Run heavy YOLO every 3rd frame, reuse boxes on in-between frames
 
 # Classification confidence threshold (below this is labeled 'Uncertain / Insect')
 CLASSIFICATION_THRESHOLD = 0.80
 
-# Minimum & maximum bounding box area (in pixels) to filter noise/dust
-MIN_BBOX_AREA = 100
+# Minimum & maximum bounding box area (in pixels) to filter noise/dust/glue beads
+MIN_BBOX_AREA = 250
 MAX_BBOX_AREA = 60000
 
 # Bounding box padding factor (adds margin around the insect before 64x64 crop)
