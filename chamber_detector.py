@@ -281,7 +281,9 @@ class ChamberDetector:
                 time.sleep(0.01)
                 continue
 
-            # If in YOLO mode, run our custom trained mosquito model directly
+            candidate_boxes = []
+
+            # 1. Get candidate bounding boxes using active detection mode
             if self.mode == "yolo" and self.yolo_model is not None:
                 h, w, _ = frame_to_process.shape
                 if getattr(config, 'USE_CHAMBER_ROI', False):
@@ -295,59 +297,44 @@ class ChamberDetector:
                     proc_frame = frame_to_process
                     offset_x, offset_y = 0, 0
 
-                results = self.yolo_model(proc_frame, conf=config.YOLO_CONF_THRESHOLD, imgsz=getattr(config, 'YOLO_IMGSZ', 256), verbose=False)
-                new_detections = []
+                results = self.yolo_model(proc_frame, conf=config.YOLO_CONF_THRESHOLD, imgsz=getattr(config, 'YOLO_IMGSZ', 320), verbose=False)
                 for r in results:
                     for b in r.boxes:
-                        cls_id = int(b.cls[0])
-                        conf = float(b.conf[0])
-                        species = self.yolo_model.names[cls_id]
-
                         coords = b.xyxy.cpu().numpy()[0]
                         x1, y1, x2, y2 = map(int, coords[:4])
                         area = (x2 - x1) * (y2 - y1)
-                        if not (config.MIN_BBOX_AREA <= area <= config.MAX_BBOX_AREA):
-                            continue
-
-                        full_box = (x1 + offset_x, y1 + offset_y, x2 + offset_x, y2 + offset_y)
-                        if "aegypti" in species.lower():
-                            color = (0, 0, 255)  # Red for Aedes aegypti
-                        else:
-                            color = (255, 140, 0)  # Orange for Aedes albopictus
-
-                        label = f"{species}: {conf*100:.1f}%"
-                        self.log_detection(species, conf, full_box, frame_to_process)
-                        new_detections.append((full_box, label, color))
-
-                with self.lock:
-                    self.active_detections = new_detections
+                        if config.MIN_BBOX_AREA <= area <= config.MAX_BBOX_AREA:
+                            candidate_boxes.append((x1 + offset_x, y1 + offset_y, x2 + offset_x, y2 + offset_y))
             else:
-                # Contrast Mode: detect candidate dark objects and verify with Stage 2 classifier
-                boxes = self.detect_boxes(frame_to_process)
-                new_detections = []
+                candidate_boxes = self.detect_boxes(frame_to_process)
 
-                for box in boxes:
-                    crop = self.crop_box(frame_to_process, box)
-                    if crop.size == 0:
-                        continue
+            # 2. Stage 2 Two-Stage Verification: Run 64x64 CNN Classifier on each candidate crop
+            new_detections = []
+            for box in candidate_boxes:
+                crop = self.crop_box(frame_to_process, box)
+                if crop.size == 0:
+                    continue
 
-                    species, conf, probs = self.classifier.classify_crop(crop)
+                species, conf, probs = self.classifier.classify_crop(crop)
 
-                    if conf >= config.CLASSIFICATION_THRESHOLD:
-                        if "aegypti" in species.lower():
-                            color = (0, 0, 255)
-                        else:
-                            color = (255, 140, 0)
-                        label = f"{species}: {conf*100:.1f}%"
-                        self.log_detection(species, conf, box, frame_to_process)
+                # Strict Verification: Only declare confirmed alert if confidence >= 80%
+                if conf >= config.CLASSIFICATION_THRESHOLD:
+                    if "aegypti" in species.lower():
+                        color = (0, 0, 255)  # Bright RED (BGR) for Aedes aegypti
                     else:
-                        color = (200, 200, 200)
-                        label = f"Insect ({species} {conf*100:.0f}%)"
-
+                        color = (0, 140, 255)  # Bright ORANGE (BGR) for Aedes albopictus
+                    label = f"{species}: {conf*100:.1f}%"
+                    self.log_detection(species, conf, box, frame_to_process)
+                    new_detections.append((box, label, color))
+                else:
+                    # Low-confidence objects (e.g. 35% on screw/fly) are labeled Uncertain / Non-Target in gray
+                    # and NEVER trigger false snapshot alarms!
+                    color = (180, 180, 180)  # Neutral Gray
+                    label = f"Non-Target ({species} {conf*100:.0f}%)"
                     new_detections.append((box, label, color))
 
-                with self.lock:
-                    self.active_detections = new_detections
+            with self.lock:
+                self.active_detections = new_detections
 
     def detect_boxes(self, frame):
         """

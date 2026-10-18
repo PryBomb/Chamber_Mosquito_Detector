@@ -39,12 +39,12 @@ FPS = 30
 # Detection mode: 'yolo' (Accurate AI insect detection) or 'chamber_contrast'
 DETECTION_MODE = "yolo"
 
-# YOLO confidence threshold & input image size for fast Pi inference
-YOLO_CONF_THRESHOLD = 0.35
+# YOLO confidence threshold (0.50 ensures low-confidence noise & smudges are rejected)
+YOLO_CONF_THRESHOLD = 0.50
 YOLO_IMGSZ = 320  # Fast inference resolution (320x320) for smooth Raspberry Pi FPS
-YOLO_FRAME_INTERVAL = 3  # Run heavy YOLO every 3rd frame, reuse boxes on in-between frames
+YOLO_FRAME_INTERVAL = 1  # Continuous background inference
 
-# Classification confidence threshold (below this is labeled 'Uncertain / Insect')
+# Classification confidence threshold (below 80% is labeled 'Uncertain / Non-Target' and suppressed)
 CLASSIFICATION_THRESHOLD = 0.80
 
 # Minimum & maximum bounding box area (in pixels) to filter noise/dust/glue beads
