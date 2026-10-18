@@ -14,7 +14,7 @@ os.makedirs(CAPTURES_DIR, exist_ok=True)
 TFLITE_MODEL_PATH = os.path.join(MODELS_DIR, "mosquito_model.tflite")
 ONNX_MODEL_PATH = os.path.join(MODELS_DIR, "mosquito_model.onnx")
 PKL_MODEL_PATH = os.path.join(MODELS_DIR, "mosquito_model.pkl")
-YOLO_MODEL_PATH = "yolov8n.pt"  # Will automatically download on first run
+YOLO_MODEL_PATH = os.path.join(MODELS_DIR, "mosquito_yolo11.pt")
 
 # Class labels for the 2nd-stage classifier (matches mosquito_model.tflite training)
 SPECIES_CLASSES = ["Aedes aegypti", "Aedes albopictus"]

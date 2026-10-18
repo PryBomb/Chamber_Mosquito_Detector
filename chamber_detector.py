@@ -281,44 +281,82 @@ class ChamberDetector:
                 time.sleep(0.01)
                 continue
 
-            # Run detection on the background frame
-            boxes = self.detect_boxes(frame_to_process)
-            new_detections = []
-
-            for box in boxes:
-                x1, y1, x2, y2 = box
-                crop = self.crop_box(frame_to_process, box)
-                if crop.size == 0:
-                    continue
-
-                species, conf, probs = self.classifier.classify_crop(crop)
-
-                if conf >= config.CLASSIFICATION_THRESHOLD:
-                    if "aegypti" in species.lower():
-                        color = (0, 0, 255)  # Red for Aedes aegypti
-                    else:
-                        color = (255, 140, 0)  # Orange for Aedes albopictus
-                    label = f"{species}: {conf*100:.1f}%"
-                    self.log_detection(species, conf, box, frame_to_process)
+            # If in YOLO mode, run our custom trained mosquito model directly
+            if self.mode == "yolo" and self.yolo_model is not None:
+                h, w, _ = frame_to_process.shape
+                if getattr(config, 'USE_CHAMBER_ROI', False):
+                    xmin = int(w * config.ROI_MARGIN_X)
+                    xmax = int(w * (1.0 - config.ROI_MARGIN_X))
+                    ymin = int(h * config.ROI_MARGIN_Y)
+                    ymax = int(h * (1.0 - config.ROI_MARGIN_Y))
+                    proc_frame = frame_to_process[ymin:ymax, xmin:xmax]
+                    offset_x, offset_y = xmin, ymin
                 else:
-                    color = (200, 200, 200)
-                    label = f"Insect ({species} {conf*100:.0f}%)"
+                    proc_frame = frame_to_process
+                    offset_x, offset_y = 0, 0
 
-                new_detections.append((box, label, color))
+                results = self.yolo_model(proc_frame, conf=config.YOLO_CONF_THRESHOLD, imgsz=getattr(config, 'YOLO_IMGSZ', 256), verbose=False)
+                new_detections = []
+                for r in results:
+                    for b in r.boxes:
+                        cls_id = int(b.cls[0])
+                        conf = float(b.conf[0])
+                        species = self.yolo_model.names[cls_id]
 
-            with self.lock:
-                self.active_detections = new_detections
+                        coords = b.xyxy.cpu().numpy()[0]
+                        x1, y1, x2, y2 = map(int, coords[:4])
+                        area = (x2 - x1) * (y2 - y1)
+                        if not (config.MIN_BBOX_AREA <= area <= config.MAX_BBOX_AREA):
+                            continue
+
+                        full_box = (x1 + offset_x, y1 + offset_y, x2 + offset_x, y2 + offset_y)
+                        if "aegypti" in species.lower():
+                            color = (0, 0, 255)  # Red for Aedes aegypti
+                        else:
+                            color = (255, 140, 0)  # Orange for Aedes albopictus
+
+                        label = f"{species}: {conf*100:.1f}%"
+                        self.log_detection(species, conf, full_box, frame_to_process)
+                        new_detections.append((full_box, label, color))
+
+                with self.lock:
+                    self.active_detections = new_detections
+            else:
+                # Contrast Mode: detect candidate dark objects and verify with Stage 2 classifier
+                boxes = self.detect_boxes(frame_to_process)
+                new_detections = []
+
+                for box in boxes:
+                    crop = self.crop_box(frame_to_process, box)
+                    if crop.size == 0:
+                        continue
+
+                    species, conf, probs = self.classifier.classify_crop(crop)
+
+                    if conf >= config.CLASSIFICATION_THRESHOLD:
+                        if "aegypti" in species.lower():
+                            color = (0, 0, 255)
+                        else:
+                            color = (255, 140, 0)
+                        label = f"{species}: {conf*100:.1f}%"
+                        self.log_detection(species, conf, box, frame_to_process)
+                    else:
+                        color = (200, 200, 200)
+                        label = f"Insect ({species} {conf*100:.0f}%)"
+
+                    new_detections.append((box, label, color))
+
+                with self.lock:
+                    self.active_detections = new_detections
 
     def detect_boxes(self, frame):
         """
-        Stage 1: Detect candidate bounding boxes for insects.
+        Stage 1 Contrast Mode: Detect candidate bounding boxes for dark insects.
         Respects calibrated Chamber ROI to exclude acrylic wall seams.
-        Returns a list of boxes [(x1, y1, x2, y2), ...]
         """
         boxes = []
         h, w, _ = frame.shape
 
-        # Calculate Chamber ROI boundaries
         if getattr(config, 'USE_CHAMBER_ROI', False):
             xmin = int(w * config.ROI_MARGIN_X)
             xmax = int(w * (1.0 - config.ROI_MARGIN_X))
@@ -330,53 +368,26 @@ class ChamberDetector:
             proc_frame = frame
             offset_x, offset_y = 0, 0
 
-        # Initialize background model if not present
-        if not hasattr(self, 'bg_gray') or self.bg_gray is None:
-            gray_proc = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2GRAY)
-            self.bg_gray = cv2.GaussianBlur(gray_proc, (9, 9), 0).astype(np.float32)
-            print("[INFO] Background baseline captured. Chamber calibrated.")
+        # Contrast Mode: Strict Dark Mosquito Detection
+        gray = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        if self.mode == "yolo" and self.yolo_model is not None:
-            self.frame_count += 1
-            # Run heavy YOLO only every Nth frame (YOLO_FRAME_INTERVAL) to boost FPS to 15-20+ on Pi
-            interval = getattr(config, 'YOLO_FRAME_INTERVAL', 3)
-            if self.frame_count % interval == 1 or not self.cached_boxes:
-                new_boxes = []
-                results = self.yolo_model(proc_frame, conf=config.YOLO_CONF_THRESHOLD, imgsz=getattr(config, 'YOLO_IMGSZ', 256), verbose=False)
-                for r in results:
-                    for box in r.boxes.xyxy.cpu().numpy():
-                        x1, y1, x2, y2 = map(int, box[:4])
-                        area = (x2 - x1) * (y2 - y1)
-                        if config.MIN_BBOX_AREA <= area <= config.MAX_BBOX_AREA:
-                            new_boxes.append((x1 + offset_x, y1 + offset_y, x2 + offset_x, y2 + offset_y))
-                self.cached_boxes = new_boxes
-            return self.cached_boxes
-        else:
-            # Contrast Mode: Absolute Dark Mosquito Detection
-            # White floor is bright (pixel values ~180-230). Mosquitoes are dark (pixel values <100).
-            # Transparent glue beads are bright (~170-210) and will NOT trigger!
-            gray = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2GRAY)
-            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        floor_lum = np.median(blurred)
+        thresh_val = max(50, int(floor_lum - 55))
+        _, thresh = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY_INV)
 
-            # Strict dark threshold: only pixels significantly darker than the clean floor
-            # Transparent glue has virtually no dark pigment.
-            floor_lum = np.median(blurred)
-            thresh_val = max(50, int(floor_lum - 55))
-            _, thresh = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY_INV)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-            # Morphological cleaning
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-            cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-            cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-            contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                if config.MIN_BBOX_AREA <= area <= config.MAX_BBOX_AREA:
-                    x, y, bw, bh = cv2.boundingRect(cnt)
-                    aspect = float(bw) / float(bh)
-                    if 0.3 <= aspect <= 3.5:
-                        boxes.append((x + offset_x, y + offset_y, x + bw + offset_x, y + bh + offset_y))
+        contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if config.MIN_BBOX_AREA <= area <= config.MAX_BBOX_AREA:
+                x, y, bw, bh = cv2.boundingRect(cnt)
+                aspect = float(bw) / float(bh)
+                if 0.3 <= aspect <= 3.5:
+                    boxes.append((x + offset_x, y + offset_y, x + bw + offset_x, y + bh + offset_y))
 
         return boxes
 
