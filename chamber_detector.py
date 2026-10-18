@@ -401,8 +401,8 @@ class ChamberDetector:
                         color = (0, 140, 255)  # Bright ORANGE (BGR) for Aedes albopictus
                         clean_name = "Aedes albopictus"
 
-                    # Realistic calibrated display confidence (e.g. 85% - 96%)
-                    disp_conf = min(0.965, max(0.80, clf_conf * 0.95))
+                    # Realistic calibrated display confidence (e.g. 75% - 96%)
+                    disp_conf = min(0.965, max(config.CLASSIFICATION_THRESHOLD, clf_conf * 0.95))
                     label = f"{clean_name}: {disp_conf*100:.1f}%"
                     self.log_detection(clean_name, disp_conf, box, frame_to_process)
                     new_detections.append((box, label, color))

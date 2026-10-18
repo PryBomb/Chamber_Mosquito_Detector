@@ -44,8 +44,8 @@ YOLO_CONF_THRESHOLD = 0.35
 YOLO_IMGSZ = 512  # Optimal resolution (512x512) for capturing small insect features accurately
 YOLO_FRAME_INTERVAL = 1  # Continuous background inference
 
-# Classification confidence threshold (below 80% is labeled 'Uncertain / Non-Target' and suppressed)
-CLASSIFICATION_THRESHOLD = 0.80
+# Classification confidence threshold (below 70% is labeled 'Other Species' and suppressed)
+CLASSIFICATION_THRESHOLD = 0.70
 
 # Minimum & maximum bounding box area (in pixels) to filter noise/dust/glue beads
 MIN_BBOX_AREA = 250
