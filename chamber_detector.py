@@ -375,6 +375,7 @@ class ChamberDetector:
             prev_time = now
 
             display = frame.copy()
+            h, w, _ = display.shape
 
             # Stage 1: Detect candidate insect bounding boxes
             boxes = self.detect_boxes(frame)
@@ -418,7 +419,6 @@ class ChamberDetector:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
 
             # Draw HUD bar
-            h, w, _ = display.shape
             cv2.rectangle(display, (0, 0), (w, 55), (20, 20, 20), -1)
             src_info = f"File: {self.camera.current_filename} | " if getattr(self.camera, 'is_image_folder', False) else ""
             hud_text = f"{src_info}FPS: {fps:.1f} | Mode: {self.mode.upper()} | Insects: {detected_count}"
