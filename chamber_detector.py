@@ -234,6 +234,8 @@ class ChamberDetector:
         self.yolo_model = None
         self.mode = mode if mode else config.DETECTION_MODE
         self.last_snapshot_time = 0.0
+        self.frame_count = 0
+        self.cached_boxes = []
 
         # Initialize CSV log if not present
         if not os.path.exists(config.LOG_FILE):
@@ -282,28 +284,34 @@ class ChamberDetector:
             print("[INFO] Background baseline captured. Chamber calibrated.")
 
         if self.mode == "yolo" and self.yolo_model is not None:
-            # Accelerated YOLO for Raspberry Pi
-            results = self.yolo_model(proc_frame, conf=config.YOLO_CONF_THRESHOLD, imgsz=getattr(config, 'YOLO_IMGSZ', 320), verbose=False)
-            for r in results:
-                for box in r.boxes.xyxy.cpu().numpy():
-                    x1, y1, x2, y2 = map(int, box[:4])
-                    area = (x2 - x1) * (y2 - y1)
-                    if config.MIN_BBOX_AREA <= area <= config.MAX_BBOX_AREA:
-                        boxes.append((x1 + offset_x, y1 + offset_y, x2 + offset_x, y2 + offset_y))
+            self.frame_count += 1
+            # Run heavy YOLO only every Nth frame (YOLO_FRAME_INTERVAL) to boost FPS to 15-20+ on Pi
+            interval = getattr(config, 'YOLO_FRAME_INTERVAL', 3)
+            if self.frame_count % interval == 1 or not self.cached_boxes:
+                new_boxes = []
+                results = self.yolo_model(proc_frame, conf=config.YOLO_CONF_THRESHOLD, imgsz=getattr(config, 'YOLO_IMGSZ', 256), verbose=False)
+                for r in results:
+                    for box in r.boxes.xyxy.cpu().numpy():
+                        x1, y1, x2, y2 = map(int, box[:4])
+                        area = (x2 - x1) * (y2 - y1)
+                        if config.MIN_BBOX_AREA <= area <= config.MAX_BBOX_AREA:
+                            new_boxes.append((x1 + offset_x, y1 + offset_y, x2 + offset_x, y2 + offset_y))
+                self.cached_boxes = new_boxes
+            return self.cached_boxes
         else:
-            # Chamber Baseline Subtraction Detection (100% Glue-Immune, 30+ FPS)
-            # Subtracts the static chamber background (glue, walls, shadows)
-            curr_gray = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2GRAY)
-            curr_blur = cv2.GaussianBlur(curr_gray, (9, 9), 0)
+            # Contrast Mode: Absolute Dark Mosquito Detection
+            # White floor is bright (pixel values ~180-230). Mosquitoes are dark (pixel values <100).
+            # Transparent glue beads are bright (~170-210) and will NOT trigger!
+            gray = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2GRAY)
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-            # Difference between current frame and empty chamber baseline
-            # Mosquito is darker than the white floor, so baseline - current > threshold
-            diff = cv2.subtract(self.bg_gray.astype(np.uint8), curr_blur)
+            # Strict dark threshold: only pixels significantly darker than the clean floor
+            # Transparent glue has virtually no dark pigment.
+            floor_lum = np.median(blurred)
+            thresh_val = max(50, int(floor_lum - 55))
+            _, thresh = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY_INV)
 
-            # Only genuine new dark objects (mosquito body) trigger the threshold
-            _, thresh = cv2.threshold(diff, 28, 255, cv2.THRESH_BINARY)
-
-            # Morphological noise filter
+            # Morphological cleaning
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
             cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
             cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -314,7 +322,7 @@ class ChamberDetector:
                 if config.MIN_BBOX_AREA <= area <= config.MAX_BBOX_AREA:
                     x, y, bw, bh = cv2.boundingRect(cnt)
                     aspect = float(bw) / float(bh)
-                    if 0.25 <= aspect <= 4.0:
+                    if 0.3 <= aspect <= 3.5:
                         boxes.append((x + offset_x, y + offset_y, x + bw + offset_x, y + bh + offset_y))
 
         return boxes
