@@ -268,6 +268,53 @@ class ChamberDetector:
         self.ai_thread.start()
         print("[INFO] Asynchronous AI worker thread started for smooth 30 FPS display.")
 
+    def check_morphology(self, crop):
+        """
+        Validates insect morphology to eliminate non-mosquito objects:
+        - Screws, bolts, and metal hardware have solid, thick cores and high solidity.
+        - Mosquitoes have slender bodies and thin spindly legs that erode rapidly under morphological erosion.
+        """
+        if crop is None or crop.size == 0:
+            return False, "Empty crop"
+
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        floor_lum = np.percentile(gray, 85)
+        # Threshold dark insect pixels against white chamber floor
+        dark_mask = (gray < (floor_lum - 30)).astype(np.uint8) * 255
+        orig_dark_count = np.count_nonzero(dark_mask)
+
+        # Minimum dark pixel threshold (reject microscopic dust/smudges)
+        if orig_dark_count < 80:
+            return False, "Too few dark pixels (dust/smudge)"
+
+        # 1. Core Thickness / Erosion test:
+        # A screw has a thick solid cylinder core; a mosquito has slender legs and needle body.
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        eroded = cv2.erode(dark_mask, k, iterations=3)
+        eroded_dark_count = np.count_nonzero(eroded)
+        retention = eroded_dark_count / max(orig_dark_count, 1)
+
+        max_retention = getattr(config, 'MAX_CORE_RETENTION', 0.20)
+        if retention > max_retention:
+            return False, f"Solid metal / screw detected (core retention {retention:.1%})"
+
+        # 2. Contour Solidity test:
+        cnts, _ = cv2.findContours(dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            return False, "No contour found"
+
+        c = max(cnts, key=cv2.contourArea)
+        area = cv2.contourArea(c)
+        hull = cv2.convexHull(c)
+        hull_area = cv2.contourArea(hull)
+        solidity = area / max(hull_area, 1.0)
+
+        max_solidity = getattr(config, 'MAX_INSECT_SOLIDITY', 0.65)
+        if solidity > max_solidity:
+            return False, f"Dense solid object (solidity {solidity:.2f})"
+
+        return True, f"Valid mosquito (solidity {solidity:.2f}, core {retention:.1%})"
+
     def _ai_worker_loop(self):
         """Background thread: runs AI inference without blocking the 30 FPS camera feed."""
         while self.worker_running:
@@ -297,22 +344,40 @@ class ChamberDetector:
                     proc_frame = frame_to_process
                     offset_x, offset_y = 0, 0
 
-                results = self.yolo_model(proc_frame, conf=config.YOLO_CONF_THRESHOLD, imgsz=getattr(config, 'YOLO_IMGSZ', 320), verbose=False)
+                results = self.yolo_model(proc_frame, conf=config.YOLO_CONF_THRESHOLD, imgsz=getattr(config, 'YOLO_IMGSZ', 224), verbose=False)
                 for r in results:
                     for b in r.boxes:
                         coords = b.xyxy.cpu().numpy()[0]
                         x1, y1, x2, y2 = map(int, coords[:4])
                         area = (x2 - x1) * (y2 - y1)
                         if config.MIN_BBOX_AREA <= area <= config.MAX_BBOX_AREA:
-                            candidate_boxes.append((x1 + offset_x, y1 + offset_y, x2 + offset_x, y2 + offset_y))
+                            yolo_conf = float(b.conf[0])
+                            yolo_cls = int(b.cls[0])
+                            candidate_boxes.append((x1 + offset_x, y1 + offset_y, x2 + offset_x, y2 + offset_y, yolo_conf, yolo_cls))
             else:
                 candidate_boxes = self.detect_boxes(frame_to_process)
 
-            # 2. Stage 2 Two-Stage Verification: Run 64x64 CNN Classifier on each candidate crop
+            # 2. Stage 2 Two-Stage Verification: Run Morphology Check & 64x64 CNN Classifier
             new_detections = []
-            for box in candidate_boxes:
+            for item in candidate_boxes:
+                if len(item) == 6:
+                    x1, y1, x2, y2, yolo_conf, yolo_cls = item
+                    box = (x1, y1, x2, y2)
+                else:
+                    box = item[:4]
+                    yolo_conf, yolo_cls = None, None
+
                 crop = self.crop_box(frame_to_process, box)
                 if crop.size == 0:
+                    continue
+
+                # Morphological insect validation: Rejects solid screws, bolts, and dense non-insects
+                is_insect, morph_reason = self.check_morphology(crop)
+                if not is_insect:
+                    # Mark solid non-mosquito objects in neutral gray and suppress alert/snapshot
+                    color = (130, 130, 130)
+                    label = f"Ignored: Screw/Solid"
+                    new_detections.append((box, label, color))
                     continue
 
                 species, conf, probs = self.classifier.classify_crop(crop)
@@ -327,10 +392,9 @@ class ChamberDetector:
                     self.log_detection(species, conf, box, frame_to_process)
                     new_detections.append((box, label, color))
                 else:
-                    # Low-confidence objects (e.g. 35% on screw/fly) are labeled Uncertain / Non-Target in gray
-                    # and NEVER trigger false snapshot alarms!
+                    # Low-confidence objects are labeled Uncertain in gray
                     color = (180, 180, 180)  # Neutral Gray
-                    label = f"Non-Target ({species} {conf*100:.0f}%)"
+                    label = f"Uncertain ({species} {conf*100:.0f}%)"
                     new_detections.append((box, label, color))
 
             with self.lock:
@@ -339,7 +403,7 @@ class ChamberDetector:
     def detect_boxes(self, frame):
         """
         Stage 1 Contrast Mode: Detect candidate bounding boxes for dark insects.
-        Respects calibrated Chamber ROI to exclude acrylic wall seams.
+        Respects calibrated Chamber ROI and eliminates dense screws/glue beads.
         """
         boxes = []
         h, w, _ = frame.shape
@@ -360,7 +424,7 @@ class ChamberDetector:
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
         floor_lum = np.median(blurred)
-        thresh_val = max(50, int(floor_lum - 55))
+        thresh_val = max(50, int(floor_lum - 50))
         _, thresh = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY_INV)
 
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
@@ -373,10 +437,16 @@ class ChamberDetector:
             if config.MIN_BBOX_AREA <= area <= config.MAX_BBOX_AREA:
                 x, y, bw, bh = cv2.boundingRect(cnt)
                 aspect = float(bw) / float(bh)
-                if 0.3 <= aspect <= 3.5:
-                    boxes.append((x + offset_x, y + offset_y, x + bw + offset_x, y + bh + offset_y))
+                if 0.35 <= aspect <= 3.0:
+                    hull = cv2.convexHull(cnt)
+                    hull_area = cv2.contourArea(hull)
+                    solidity = area / max(hull_area, 1.0)
+                    # Exclude dense solid objects (screws, glue beads) directly in stage 1
+                    if solidity <= getattr(config, 'MAX_INSECT_SOLIDITY', 0.65):
+                        boxes.append((x + offset_x, y + offset_y, x + bw + offset_x, y + bh + offset_y, None, None))
 
         return boxes
+
 
     def crop_box(self, frame, box):
         """Adds padding around bounding box and crops safely within frame boundaries."""
@@ -395,6 +465,59 @@ class ChamberDetector:
 
         crop = frame[cy1:cy2, cx1:cx2]
         return crop
+
+    def track_box_in_live_frame(self, frame, box):
+        """
+        Micro-tracks insect bounding box on the 30 FPS live stream.
+        Runs in < 0.5ms per frame to eliminate any spatial lag behind moving mosquitoes.
+        """
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = box
+        bw, bh = x2 - x1, y2 - y1
+
+        # Search window slightly larger than the box (+/- 25 px)
+        sx1 = max(0, x1 - 25)
+        sy1 = max(0, y1 - 25)
+        sx2 = min(w, x2 + 25)
+        sy2 = min(h, y2 + 25)
+
+        patch = frame[sy1:sy2, sx1:sx2]
+        if patch.size == 0:
+            return box
+
+        gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+        floor_lum = np.percentile(gray, 85)
+        dark_mask = (gray < (floor_lum - 28)).astype(np.uint8) * 255
+
+        cnts, _ = cv2.findContours(dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            return box
+
+        c = max(cnts, key=cv2.contourArea)
+        if cv2.contourArea(c) < 50:
+            return box
+
+        M = cv2.moments(c)
+        if M['m00'] == 0:
+            return box
+
+        # Centroid in live frame coordinates
+        cx = int(M['m10'] / M['m00']) + sx1
+        cy = int(M['m01'] / M['m00']) + sy1
+
+        old_cx = (x1 + x2) // 2
+        old_cy = (y1 + y2) // 2
+
+        dx = cx - old_cx
+        dy = cy - old_cy
+
+        # Only shift if reasonable movement (< 40 px between consecutive 33ms frames)
+        if abs(dx) < 40 and abs(dy) < 40:
+            nx1 = max(0, min(w - bw, x1 + dx))
+            ny1 = max(0, min(h - bh, y1 + dy))
+            return (nx1, ny1, nx1 + bw, ny1 + bh)
+
+        return box
 
     def log_detection(self, species, confidence, box, frame):
         """Logs detection to CSV and saves snapshot."""
@@ -450,7 +573,15 @@ class ChamberDetector:
                 self.latest_frame = frame
                 detections = list(self.active_detections)
 
-            detected_count = len(detections)
+            # Live Micro-Tracking: Instantly lock boxes onto live moving insect (0ms delay)
+            if getattr(config, 'ENABLE_LIVE_TRACKING', True) and detections:
+                tracked_detections = []
+                for box, label, color in detections:
+                    tracked_box = self.track_box_in_live_frame(frame, box)
+                    tracked_detections.append((tracked_box, label, color))
+                detections = tracked_detections
+
+            detected_count = sum(1 for _, label, _ in detections if not label.startswith("Ignored"))
 
             # Draw asynchronous AI detections (boxes, labels, confidence)
             for box, label, color in detections:
@@ -458,6 +589,7 @@ class ChamberDetector:
                 cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
                 cv2.putText(display, label, (x1, max(20, y1 - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+
 
             # Draw Chamber ROI overlay if enabled
             if getattr(config, 'SHOW_ROI_OVERLAY', False) and getattr(config, 'USE_CHAMBER_ROI', False):

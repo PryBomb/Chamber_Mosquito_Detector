@@ -72,7 +72,8 @@ def evaluate_dataset(dataset_dir, is_negative=True, mode=None, save_debug=True):
 
             if save_debug:
                 debug_frame = frame.copy()
-                for (bx1, by1, bx2, by2) in boxes:
+                for b in boxes:
+                    bx1, by1, bx2, by2 = b[:4]
                     cv2.rectangle(debug_frame, (bx1, by1), (bx2, by2), (0, 0, 255), 2)
                     cv2.putText(debug_frame, f"FP ({bx2-bx1}x{by2-by1})", (bx1, max(15, by1 - 5)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
