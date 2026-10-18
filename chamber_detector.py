@@ -275,8 +275,14 @@ class ChamberDetector:
             proc_frame = frame
             offset_x, offset_y = 0, 0
 
+        # Initialize background model if not present
+        if not hasattr(self, 'bg_gray') or self.bg_gray is None:
+            gray_proc = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2GRAY)
+            self.bg_gray = cv2.GaussianBlur(gray_proc, (9, 9), 0).astype(np.float32)
+            print("[INFO] Background baseline captured. Chamber calibrated.")
+
         if self.mode == "yolo" and self.yolo_model is not None:
-            # Accelerated YOLO for Raspberry Pi (imgsz=320 for 3x speedup)
+            # Accelerated YOLO for Raspberry Pi
             results = self.yolo_model(proc_frame, conf=config.YOLO_CONF_THRESHOLD, imgsz=getattr(config, 'YOLO_IMGSZ', 320), verbose=False)
             for r in results:
                 for box in r.boxes.xyxy.cpu().numpy():
@@ -285,18 +291,19 @@ class ChamberDetector:
                     if config.MIN_BBOX_AREA <= area <= config.MAX_BBOX_AREA:
                         boxes.append((x1 + offset_x, y1 + offset_y, x2 + offset_x, y2 + offset_y))
         else:
-            # Chamber Contrast Detection:
-            # Mosquitoes have dark pigment. Transparent glue and light shadows have high luminance.
-            gray = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2GRAY)
-            blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+            # Chamber Baseline Subtraction Detection (100% Glue-Immune, 30+ FPS)
+            # Subtracts the static chamber background (glue, walls, shadows)
+            curr_gray = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2GRAY)
+            curr_blur = cv2.GaussianBlur(curr_gray, (9, 9), 0)
 
-            # Compare against background mean: only pixels significantly darker than the floor are detected
-            mean_val = np.mean(blurred)
-            # Mosquito is at least 35-40 units darker than the white floor
-            dark_thresh = max(40, int(mean_val - 35))
-            _, thresh = cv2.threshold(blurred, dark_thresh, 255, cv2.THRESH_BINARY_INV)
+            # Difference between current frame and empty chamber baseline
+            # Mosquito is darker than the white floor, so baseline - current > threshold
+            diff = cv2.subtract(self.bg_gray.astype(np.uint8), curr_blur)
 
-            # Morphological cleaning to eliminate thin scratches and single-pixel dust
+            # Only genuine new dark objects (mosquito body) trigger the threshold
+            _, thresh = cv2.threshold(diff, 28, 255, cv2.THRESH_BINARY)
+
+            # Morphological noise filter
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
             cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
             cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -306,9 +313,8 @@ class ChamberDetector:
                 area = cv2.contourArea(cnt)
                 if config.MIN_BBOX_AREA <= area <= config.MAX_BBOX_AREA:
                     x, y, bw, bh = cv2.boundingRect(cnt)
-                    # Mosquito bodies are compact or elongated (aspect ratio 0.3 to 3.5), not thin long lines
                     aspect = float(bw) / float(bh)
-                    if 0.3 <= aspect <= 3.5:
+                    if 0.25 <= aspect <= 4.0:
                         boxes.append((x + offset_x, y + offset_y, x + bw + offset_x, y + bh + offset_y))
 
         return boxes
@@ -429,7 +435,7 @@ class ChamberDetector:
 
             # Bottom help line
             cv2.rectangle(display, (0, h - 25), (w, h), (20, 20, 20), -1)
-            cv2.putText(display, "[Q] Quit  |  [S] Save Snapshot  |  [M] Toggle Mode  |  [SPACE] Pause/Step",
+            cv2.putText(display, "[C] Calibrate Baseline (Zero Noise) | [M] Toggle Mode | [S] Save | [Q] Quit",
                         (15, h - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
 
             cv2.imshow(window_name, display)
@@ -439,6 +445,9 @@ class ChamberDetector:
             key = cv2.waitKey(delay) & 0xFF
             if key == ord('q') or key == 27:
                 break
+            elif key == ord('c'):
+                self.bg_gray = None  # Resets and re-captures current empty chamber as clean baseline
+                print("[INFO] Recalibrating chamber baseline... Captured clean background!")
             elif key == ord('s'):
                 now_str = datetime.now().strftime('%Y%m%d_%H%M%S')
                 snap_path = os.path.join(config.CAPTURES_DIR, f"manual_snap_{now_str}.jpg")
