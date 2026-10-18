@@ -6,6 +6,7 @@ import argparse
 from datetime import datetime
 import cv2
 import numpy as np
+import threading
 
 import config
 
@@ -237,6 +238,12 @@ class ChamberDetector:
         self.frame_count = 0
         self.cached_boxes = []
 
+        # Threaded Asynchronous AI Worker variables
+        self.latest_frame = None
+        self.active_detections = []  # List of (box, label, color)
+        self.worker_running = True
+        self.lock = threading.Lock()
+
         # Initialize CSV log if not present
         if not os.path.exists(config.LOG_FILE):
             with open(config.LOG_FILE, mode='w', newline='') as f:
@@ -255,6 +262,52 @@ class ChamberDetector:
         except Exception as e:
             print(f"[WARNING] Could not load YOLO: {e}. Falling back to 'chamber_contrast' mode.")
             self.mode = "chamber_contrast"
+
+        # Start asynchronous AI worker thread
+        self.ai_thread = threading.Thread(target=self._ai_worker_loop, daemon=True)
+        self.ai_thread.start()
+        print("[INFO] Asynchronous AI worker thread started for smooth 30 FPS display.")
+
+    def _ai_worker_loop(self):
+        """Background thread: runs AI inference without blocking the 30 FPS camera feed."""
+        while self.worker_running:
+            frame_to_process = None
+            with self.lock:
+                if self.latest_frame is not None:
+                    frame_to_process = self.latest_frame.copy()
+                    self.latest_frame = None
+
+            if frame_to_process is None:
+                time.sleep(0.01)
+                continue
+
+            # Run detection on the background frame
+            boxes = self.detect_boxes(frame_to_process)
+            new_detections = []
+
+            for box in boxes:
+                x1, y1, x2, y2 = box
+                crop = self.crop_box(frame_to_process, box)
+                if crop.size == 0:
+                    continue
+
+                species, conf, probs = self.classifier.classify_crop(crop)
+
+                if conf >= config.CLASSIFICATION_THRESHOLD:
+                    if "aegypti" in species.lower():
+                        color = (0, 0, 255)  # Red for Aedes aegypti
+                    else:
+                        color = (255, 140, 0)  # Orange for Aedes albopictus
+                    label = f"{species}: {conf*100:.1f}%"
+                    self.log_detection(species, conf, box, frame_to_process)
+                else:
+                    color = (200, 200, 200)
+                    label = f"Insect ({species} {conf*100:.0f}%)"
+
+                new_detections.append((box, label, color))
+
+            with self.lock:
+                self.active_detections = new_detections
 
     def detect_boxes(self, frame):
         """
@@ -394,33 +447,16 @@ class ChamberDetector:
             display = frame.copy()
             h, w, _ = display.shape
 
-            # Stage 1: Detect candidate insect bounding boxes
-            boxes = self.detect_boxes(frame)
+            # Feed latest frame to background AI worker without waiting
+            with self.lock:
+                self.latest_frame = frame
+                detections = list(self.active_detections)
 
-            detected_count = len(boxes)
+            detected_count = len(detections)
 
-            # Stage 2 & 3: Crop and Classify each detected insect
-            for box in boxes:
+            # Draw asynchronous AI detections (boxes, labels, confidence)
+            for box, label, color in detections:
                 x1, y1, x2, y2 = box
-                crop = self.crop_box(frame, box)
-                if crop.size == 0:
-                    continue
-
-                species, conf, probs = self.classifier.classify_crop(crop)
-
-                # Determine display color and alert status
-                if conf >= config.CLASSIFICATION_THRESHOLD:
-                    if "aegypti" in species.lower():
-                        color = (0, 0, 255)  # Red for Aedes aegypti (Dengue/Zika vector)
-                    else:
-                        color = (255, 140, 0)  # Orange for Aedes albopictus
-                    label = f"{species}: {conf*100:.1f}%"
-                    self.log_detection(species, conf, box, frame)
-                else:
-                    color = (200, 200, 200)
-                    label = f"Insect ({species} {conf*100:.0f}%)"
-
-                # Draw bounding box & tag
                 cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
                 cv2.putText(display, label, (x1, max(20, y1 - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)

@@ -36,8 +36,8 @@ FRAME_HEIGHT = 720
 FPS = 30
 
 # Detection & Classification Parameters
-# Detection mode: 'chamber_contrast' (Fast 40+ FPS for white chamber) or 'yolo' (Heavy deep learning)
-DETECTION_MODE = "chamber_contrast"
+# Detection mode: 'yolo' (Accurate AI insect detection) or 'chamber_contrast'
+DETECTION_MODE = "yolo"
 
 # YOLO confidence threshold & input image size for fast Pi inference
 YOLO_CONF_THRESHOLD = 0.35
