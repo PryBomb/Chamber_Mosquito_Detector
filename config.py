@@ -41,7 +41,7 @@ DETECTION_MODE = "yolo"
 
 # YOLO confidence threshold (0.35 ensures all mosquitoes are detected; morphology rejects screws)
 YOLO_CONF_THRESHOLD = 0.35
-YOLO_IMGSZ = 512  # Optimal resolution (512x512) for capturing small insect features accurately
+YOLO_IMGSZ = 640  # Native training resolution (640x640) preserves small mosquito legs and features
 YOLO_FRAME_INTERVAL = 1  # Continuous background inference
 
 # Classification confidence threshold (below 70% is labeled 'Other Species' and suppressed)

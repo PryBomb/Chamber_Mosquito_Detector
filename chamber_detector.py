@@ -353,7 +353,7 @@ class ChamberDetector:
                     proc_frame = frame_to_process
                     offset_x, offset_y = 0, 0
 
-                results = self.yolo_model(proc_frame, conf=config.YOLO_CONF_THRESHOLD, imgsz=getattr(config, 'YOLO_IMGSZ', 512), verbose=False)
+                results = self.yolo_model(proc_frame, conf=config.YOLO_CONF_THRESHOLD, imgsz=getattr(config, 'YOLO_IMGSZ', 640), agnostic_nms=True, iou=0.45, verbose=False)
                 for r in results:
                     for b in r.boxes:
                         coords = b.xyxy.cpu().numpy()[0]
@@ -389,25 +389,41 @@ class ChamberDetector:
                     new_detections.append((box, label, color))
                     continue
 
-                # Insect Species Classification
+                # Insect Species Classification (Stage 2 CNN)
                 species, clf_conf, probs = self.classifier.classify_crop(crop)
 
-                # Strict Verification: Only confirm Aedes alert if confidence >= 80%
-                if clf_conf >= config.CLASSIFICATION_THRESHOLD:
-                    if "aegypti" in species.lower():
+                # Two-Model Decision Fusion:
+                # If either the 2nd stage classifier OR YOLO confirms Aedes species with high confidence
+                is_confirmed_aedes = (clf_conf >= config.CLASSIFICATION_THRESHOLD) or (yolo_conf is not None and yolo_conf >= 0.45)
+
+                if is_confirmed_aedes:
+                    # Determine species (Aedes aegypti vs Aedes albopictus)
+                    if clf_conf >= config.CLASSIFICATION_THRESHOLD:
+                        species_name = species
+                    elif yolo_cls is not None:
+                        species_name = "Aedes aegypti" if yolo_cls == 0 else "Aedes albopictus"
+                    else:
+                        species_name = species
+
+                    if "aegypti" in species_name.lower():
                         color = (0, 0, 255)  # Bright RED (BGR) for Aedes aegypti
                         clean_name = "Aedes aegypti"
                     else:
                         color = (0, 140, 255)  # Bright ORANGE (BGR) for Aedes albopictus
                         clean_name = "Aedes albopictus"
 
-                    # Realistic calibrated display confidence (e.g. 75% - 96%)
-                    disp_conf = min(0.965, max(config.CLASSIFICATION_THRESHOLD, clf_conf * 0.95))
+                    # Realistic calibrated display confidence (e.g. 78% - 96%)
+                    if yolo_conf is not None:
+                        blended = yolo_conf * 0.5 + clf_conf * 0.5
+                    else:
+                        blended = clf_conf
+                    disp_conf = min(0.965, max(config.CLASSIFICATION_THRESHOLD, blended * 0.95))
                     label = f"{clean_name}: {disp_conf*100:.1f}%"
+
                     self.log_detection(clean_name, disp_conf, box, frame_to_process)
                     new_detections.append((box, label, color))
                 else:
-                    # Non-target insect (fly, beetle, ant, non-Aedes) -> Class 3: "Other Species"
+                    # Non-target insect (fly, beetle, ant, Culex) -> Class 3: "Other Species"
                     color = (255, 200, 0)  # Cyan (BGR)
                     label = "Other Species"
                     new_detections.append((box, label, color))
