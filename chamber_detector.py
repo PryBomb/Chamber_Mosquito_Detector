@@ -475,22 +475,62 @@ class ChamberDetector:
 
 
     def crop_box(self, frame, box):
-        """Adds padding around bounding box and crops safely within frame boundaries."""
-        h, w, _ = frame.shape
+        """
+        Crops bounding box from frame according to config settings.
+        Supports aspect-preserved square cropping using real surrounding pixels,
+        or legacy rectangular padding.
+        """
+        h, w = frame.shape[:2]
         x1, y1, x2, y2 = box
-        bw = x2 - x1
-        bh = y2 - y1
+        padding = getattr(config, 'CROP_PADDING', getattr(config, 'BBOX_PADDING', 0.60))
+        use_square = getattr(config, 'USE_SQUARE_CROP', True)
 
-        pad_x = int(bw * config.BBOX_PADDING)
-        pad_y = int(bh * config.BBOX_PADDING)
+        if use_square:
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            bw = x2 - x1
+            bh = y2 - y1
 
-        cx1 = max(0, x1 - pad_x)
-        cy1 = max(0, y1 - pad_y)
-        cx2 = min(w, x2 + pad_x)
-        cy2 = min(h, y2 + pad_y)
+            side = int(max(bw, bh) * (1.0 + 2.0 * padding))
+            half = side // 2
 
-        crop = frame[cy1:cy2, cx1:cx2]
-        return crop
+            sx1 = int(cx - half)
+            sy1 = int(cy - half)
+            sx2 = sx1 + side
+            sy2 = sy1 + side
+
+            # Shift if out of bounds to preserve 1:1 aspect ratio using real pixels
+            if sx1 < 0:
+                sx2 -= sx1
+                sx1 = 0
+            if sy1 < 0:
+                sy2 -= sy1
+                sy1 = 0
+            if sx2 > w:
+                sx1 -= (sx2 - w)
+                sx2 = w
+            if sy2 > h:
+                sy1 -= (sy2 - h)
+                sy2 = h
+
+            sx1 = max(0, sx1)
+            sy1 = max(0, sy1)
+            sx2 = min(w, sx2)
+            sy2 = min(h, sy2)
+
+            return frame[sy1:sy2, sx1:sx2]
+        else:
+            bw = x2 - x1
+            bh = y2 - y1
+            pad_x = int(bw * padding)
+            pad_y = int(bh * padding)
+
+            cx1 = max(0, x1 - pad_x)
+            cy1 = max(0, y1 - pad_y)
+            cx2 = min(w, x2 + pad_x)
+            cy2 = min(h, y2 + pad_y)
+
+            return frame[cy1:cy2, cx1:cx2]
 
     def track_box_in_live_frame(self, frame, box):
         """

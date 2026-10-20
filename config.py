@@ -60,8 +60,11 @@ MAX_CORE_RETENTION = 0.32
 # Live Visual Micro-Tracking (Locks onto moving mosquito at 30 FPS with 0ms delay)
 ENABLE_LIVE_TRACKING = True
 
-# Bounding box padding factor (adds margin around the insect before 64x64 crop)
-BBOX_PADDING = 0.15
+# Bounding box crop settings for Stage 2 CNN input
+# Square crop preserves natural 1:1 aspect ratio without distorting or clipping mosquito legs
+USE_SQUARE_CROP = True
+CROP_PADDING = 0.60  # Default padding factor (0.60 square provides optimal species balance)
+BBOX_PADDING = CROP_PADDING  # Backward compatibility alias
 
 # Auto-save snapshots on detection
 AUTO_SAVE_SNAPSHOT = True
