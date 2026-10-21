@@ -9,6 +9,7 @@ import numpy as np
 import threading
 
 import config
+from mosquito_tracker import MosquitoTracker
 
 # Ensure console output handles non-ASCII folder paths safely on Windows
 if sys.platform == "win32":
@@ -238,6 +239,9 @@ class ChamberDetector:
         self.frame_count = 0
         self.cached_boxes = []
 
+        # Mosquito ID tracker (SQLite-backed, < 1ms per call)
+        self.tracker = MosquitoTracker() if getattr(config, 'ENABLE_MOSQUITO_TRACKER', True) else None
+
         # Threaded Asynchronous AI Worker variables
         self.latest_frame = None
         self.active_detections = []  # List of (box, label, color)
@@ -248,7 +252,7 @@ class ChamberDetector:
         if not os.path.exists(config.LOG_FILE):
             with open(config.LOG_FILE, mode='w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(["Timestamp", "Species", "Confidence", "BBox_X1", "BBox_Y1", "BBox_X2", "BBox_Y2", "Snapshot_File"])
+                writer.writerow(["Timestamp", "Species", "Confidence", "BBox_X1", "BBox_Y1", "BBox_X2", "BBox_Y2", "Snapshot_File", "MosquitoID", "TrackStatus"])
 
         # Try loading YOLOv8
         try:
@@ -420,7 +424,10 @@ class ChamberDetector:
                     disp_conf = min(0.965, max(config.CLASSIFICATION_THRESHOLD, blended * 0.95))
                     label = f"{clean_name}: {disp_conf*100:.1f}%"
 
-                    self.log_detection(clean_name, disp_conf, box, frame_to_process)
+                    mos_id, mos_status = self.log_detection(clean_name, disp_conf, box, frame_to_process)
+                    # Append MOS-ID to on-screen label (skip for duplicates to reduce noise)
+                    if mos_id and mos_status != "duplicate":
+                        label = f"{label}  [{mos_id}]"
                     new_detections.append((box, label, color))
                 else:
                     # Non-target insect (fly, beetle, ant, Culex) -> Class 3: "Other Species"
@@ -475,22 +482,62 @@ class ChamberDetector:
 
 
     def crop_box(self, frame, box):
-        """Adds padding around bounding box and crops safely within frame boundaries."""
-        h, w, _ = frame.shape
+        """
+        Crops bounding box from frame according to config settings.
+        Supports aspect-preserved square cropping using real surrounding pixels,
+        or legacy rectangular padding.
+        """
+        h, w = frame.shape[:2]
         x1, y1, x2, y2 = box
-        bw = x2 - x1
-        bh = y2 - y1
+        padding = getattr(config, 'CROP_PADDING', getattr(config, 'BBOX_PADDING', 0.60))
+        use_square = getattr(config, 'USE_SQUARE_CROP', True)
 
-        pad_x = int(bw * config.BBOX_PADDING)
-        pad_y = int(bh * config.BBOX_PADDING)
+        if use_square:
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            bw = x2 - x1
+            bh = y2 - y1
 
-        cx1 = max(0, x1 - pad_x)
-        cy1 = max(0, y1 - pad_y)
-        cx2 = min(w, x2 + pad_x)
-        cy2 = min(h, y2 + pad_y)
+            side = int(max(bw, bh) * (1.0 + 2.0 * padding))
+            half = side // 2
 
-        crop = frame[cy1:cy2, cx1:cx2]
-        return crop
+            sx1 = int(cx - half)
+            sy1 = int(cy - half)
+            sx2 = sx1 + side
+            sy2 = sy1 + side
+
+            # Shift if out of bounds to preserve 1:1 aspect ratio using real pixels
+            if sx1 < 0:
+                sx2 -= sx1
+                sx1 = 0
+            if sy1 < 0:
+                sy2 -= sy1
+                sy1 = 0
+            if sx2 > w:
+                sx1 -= (sx2 - w)
+                sx2 = w
+            if sy2 > h:
+                sy1 -= (sy2 - h)
+                sy2 = h
+
+            sx1 = max(0, sx1)
+            sy1 = max(0, sy1)
+            sx2 = min(w, sx2)
+            sy2 = min(h, sy2)
+
+            return frame[sy1:sy2, sx1:sx2]
+        else:
+            bw = x2 - x1
+            bh = y2 - y1
+            pad_x = int(bw * padding)
+            pad_y = int(bh * padding)
+
+            cx1 = max(0, x1 - pad_x)
+            cy1 = max(0, y1 - pad_y)
+            cx2 = min(w, x2 + pad_x)
+            cy2 = min(h, y2 + pad_y)
+
+            return frame[cy1:cy2, cx1:cx2]
 
     def track_box_in_live_frame(self, frame, box):
         """
@@ -546,25 +593,42 @@ class ChamberDetector:
         return box
 
     def log_detection(self, species, confidence, box, frame):
-        """Logs detection to CSV and saves snapshot."""
+        """Logs detection to CSV, saves snapshot, and registers with MosquitoTracker."""
         now = datetime.now()
         timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
         snapshot_filename = ""
+        snapshot_full_path = ""
 
         # Auto-save snapshot with cooldown
         current_time = time.time()
         if config.AUTO_SAVE_SNAPSHOT and (current_time - self.last_snapshot_time >= config.SNAPSHOT_COOLDOWN_SEC):
             clean_species = species.replace(" ", "_")
             file_name = f"{now.strftime('%Y%m%d_%H%M%S')}_{clean_species}_{int(confidence*100)}pct.jpg"
-            snapshot_path = os.path.join(config.CAPTURES_DIR, file_name)
-            cv2.imwrite(snapshot_path, frame)
+            snapshot_full_path = os.path.join(config.CAPTURES_DIR, file_name)
+            cv2.imwrite(snapshot_full_path, frame)
             snapshot_filename = file_name
             self.last_snapshot_time = current_time
             print(f"[ALERT] Snapshot saved: {file_name}")
 
+        # Mosquito ID tracking: deduplicate and assign unique MOS-XXX id
+        mos_id = ""
+        mos_status = ""
+        if self.tracker is not None:
+            x1, y1, x2, y2 = box
+            crop = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
+            if crop.size > 0:
+                mos_id, mos_status = self.tracker.register(
+                    crop, species, confidence, box,
+                    snapshot_full_path or None
+                )
+
         with open(config.LOG_FILE, mode='a', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow([timestamp, species, f"{confidence*100:.2f}%", box[0], box[1], box[2], box[3], snapshot_filename])
+            writer.writerow([timestamp, species, f"{confidence*100:.2f}%",
+                             box[0], box[1], box[2], box[3],
+                             snapshot_filename, mos_id, mos_status])
+
+        return mos_id, mos_status
 
     def run(self):
         print("\n=======================================================")

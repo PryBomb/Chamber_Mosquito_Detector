@@ -60,10 +60,43 @@ MAX_CORE_RETENTION = 0.32
 # Live Visual Micro-Tracking (Locks onto moving mosquito at 30 FPS with 0ms delay)
 ENABLE_LIVE_TRACKING = True
 
-# Bounding box padding factor (adds margin around the insect before 64x64 crop)
-BBOX_PADDING = 0.15
+# Bounding box crop settings for Stage 2 CNN input
+# Square crop preserves natural 1:1 aspect ratio without distorting or clipping mosquito legs
+USE_SQUARE_CROP = True
+CROP_PADDING = 0.60  # Default padding factor (0.60 square provides optimal species balance)
+BBOX_PADDING = CROP_PADDING  # Backward compatibility alias
 
 # Auto-save snapshots on detection
 AUTO_SAVE_SNAPSHOT = True
 SNAPSHOT_COOLDOWN_SEC = 2.0  # Avoid saving duplicate photos of the same mosquito
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mosquito ID Tracker (mosquito_tracker.py)
+# ─────────────────────────────────────────────────────────────────────────────
+ENABLE_MOSQUITO_TRACKER = True      # Set False to disable ID tracking entirely
+
+# SQLite local registry path
+TRACKER_DB_PATH = os.path.join(BASE_DIR, "mosquito_registry.db")
+
+# Similarity thresholds for duplicate detection (0.0 – 1.0)
+# Increase SIMILARITY_HIGH to be stricter (fewer duplicates marked as new)
+# Decrease SIMILARITY_LOW  to be more lenient (fewer unverified)
+SIMILARITY_HIGH = 0.80   # >= 80%  -> same mosquito (duplicate)
+SIMILARITY_LOW  = 0.55   # 55–80%  -> uncertain match (unverified)
+
+# Feature weights (must sum to 1.0)
+COLOR_WEIGHT = 0.65      # HSV colour histogram contribution
+MORPH_WEIGHT = 0.35      # Body shape / aspect-ratio contribution
+
+# Colour histogram bins per channel (H and S channels of HSV)
+COLOR_HIST_BINS = 32
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Supabase Cloud Sync (optional — leave SUPABASE_ENABLED = False to skip)
+# ─────────────────────────────────────────────────────────────────────────────
+SUPABASE_ENABLED = False
+SUPABASE_URL     = "https://wvudxhppveaeoitjcnrp.supabase.co"    # e.g. "https://xyzcompany.supabase.co"
+SUPABASE_KEY     = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind2dWR4aHBwdmVhZW9pdGpjbnJwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI1ODkwODgsImV4cCI6MjEwODE2NTA4OH0.qMqaovi8P_DUG_Bm38e7TAgDQIy3A4ngGXeXlxfchQQ"    # service-role or anon key
+SUPABASE_TABLE   = "mosquito_registry"
+SUPABASE_BUCKET  = "mosquito-images"
 

@@ -9,10 +9,26 @@ detection_log.csv
 captures/*
 !captures/.gitkeep
 
-# Auto-downloaded model weights
-yolov8n.pt
+# Auto-downloaded and backup model weights
 *.pt
+*.tflite
+*.onnx
+*.pkl
+models/*backup*
 !models/mosquito_yolo11.pt
+!models/mosquito_model.tflite
+
+# Image files & dataset caches anywhere in repo
+*.jpg
+*.jpeg
+*.png
+*.bmp
+
+# Scratch and evaluation media outputs
+scratch/
+eval/**/
+!eval/
+eval/*.csv
 
 # Virtual environments
 .venv/
