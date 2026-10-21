@@ -9,6 +9,7 @@ import numpy as np
 import threading
 
 import config
+from mosquito_tracker import MosquitoTracker
 
 # Ensure console output handles non-ASCII folder paths safely on Windows
 if sys.platform == "win32":
@@ -238,6 +239,9 @@ class ChamberDetector:
         self.frame_count = 0
         self.cached_boxes = []
 
+        # Mosquito ID tracker (SQLite-backed, < 1ms per call)
+        self.tracker = MosquitoTracker() if getattr(config, 'ENABLE_MOSQUITO_TRACKER', True) else None
+
         # Threaded Asynchronous AI Worker variables
         self.latest_frame = None
         self.active_detections = []  # List of (box, label, color)
@@ -248,7 +252,7 @@ class ChamberDetector:
         if not os.path.exists(config.LOG_FILE):
             with open(config.LOG_FILE, mode='w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(["Timestamp", "Species", "Confidence", "BBox_X1", "BBox_Y1", "BBox_X2", "BBox_Y2", "Snapshot_File"])
+                writer.writerow(["Timestamp", "Species", "Confidence", "BBox_X1", "BBox_Y1", "BBox_X2", "BBox_Y2", "Snapshot_File", "MosquitoID", "TrackStatus"])
 
         # Try loading YOLOv8
         try:
@@ -420,7 +424,10 @@ class ChamberDetector:
                     disp_conf = min(0.965, max(config.CLASSIFICATION_THRESHOLD, blended * 0.95))
                     label = f"{clean_name}: {disp_conf*100:.1f}%"
 
-                    self.log_detection(clean_name, disp_conf, box, frame_to_process)
+                    mos_id, mos_status = self.log_detection(clean_name, disp_conf, box, frame_to_process)
+                    # Append MOS-ID to on-screen label (skip for duplicates to reduce noise)
+                    if mos_id and mos_status != "duplicate":
+                        label = f"{label}  [{mos_id}]"
                     new_detections.append((box, label, color))
                 else:
                     # Non-target insect (fly, beetle, ant, Culex) -> Class 3: "Other Species"
@@ -586,25 +593,42 @@ class ChamberDetector:
         return box
 
     def log_detection(self, species, confidence, box, frame):
-        """Logs detection to CSV and saves snapshot."""
+        """Logs detection to CSV, saves snapshot, and registers with MosquitoTracker."""
         now = datetime.now()
         timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
         snapshot_filename = ""
+        snapshot_full_path = ""
 
         # Auto-save snapshot with cooldown
         current_time = time.time()
         if config.AUTO_SAVE_SNAPSHOT and (current_time - self.last_snapshot_time >= config.SNAPSHOT_COOLDOWN_SEC):
             clean_species = species.replace(" ", "_")
             file_name = f"{now.strftime('%Y%m%d_%H%M%S')}_{clean_species}_{int(confidence*100)}pct.jpg"
-            snapshot_path = os.path.join(config.CAPTURES_DIR, file_name)
-            cv2.imwrite(snapshot_path, frame)
+            snapshot_full_path = os.path.join(config.CAPTURES_DIR, file_name)
+            cv2.imwrite(snapshot_full_path, frame)
             snapshot_filename = file_name
             self.last_snapshot_time = current_time
             print(f"[ALERT] Snapshot saved: {file_name}")
 
+        # Mosquito ID tracking: deduplicate and assign unique MOS-XXX id
+        mos_id = ""
+        mos_status = ""
+        if self.tracker is not None:
+            x1, y1, x2, y2 = box
+            crop = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
+            if crop.size > 0:
+                mos_id, mos_status = self.tracker.register(
+                    crop, species, confidence, box,
+                    snapshot_full_path or None
+                )
+
         with open(config.LOG_FILE, mode='a', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow([timestamp, species, f"{confidence*100:.2f}%", box[0], box[1], box[2], box[3], snapshot_filename])
+            writer.writerow([timestamp, species, f"{confidence*100:.2f}%",
+                             box[0], box[1], box[2], box[3],
+                             snapshot_filename, mos_id, mos_status])
+
+        return mos_id, mos_status
 
     def run(self):
         print("\n=======================================================")
