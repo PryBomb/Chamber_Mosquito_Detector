@@ -95,17 +95,8 @@ COLOR_HIST_BINS = 32
 # Supabase Cloud Sync (optional — leave SUPABASE_ENABLED = False to skip)
 # ─────────────────────────────────────────────────────────────────────────────
 SUPABASE_ENABLED = False
-SUPABASE_URL     = ""    # e.g. "https://xyzcompany.supabase.co"
-SUPABASE_KEY     = ""    # service-role or anon key
+SUPABASE_URL     = "https://wvudxhppveaeoitjcnrp.supabase.co"    # e.g. "https://xyzcompany.supabase.co"
+SUPABASE_KEY     = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind2dWR4aHBwdmVhZW9pdGpjbnJwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI1ODkwODgsImV4cCI6MjEwODE2NTA4OH0.qMqaovi8P_DUG_Bm38e7TAgDQIy3A4ngGXeXlxfchQQ"    # service-role or anon key
 SUPABASE_TABLE   = "mosquito_registry"
 SUPABASE_BUCKET  = "mosquito-images"
 
-# Database & Cloud Sync Settings
-USE_LOCAL_SQLITE = True
-SQLITE_DB_PATH = os.path.join(BASE_DIR, "mosquito_registry.db")
-
-# Supabase Cloud Sync (Set to True when ready)
-ENABLE_SUPABASE = False  
-SUPABASE_URL = "https://wvudxhppveaeoitjcnrp.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind2dWR4aHBwdmVhZW9pdGpjbnJwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI1ODkwODgsImV4cCI6MjEwODE2NTA4OH0.qMqaovi8P_DUG_Bm38e7TAgDQIy3A4ngGXeXlxfchQQ"
-SUPABASE_BUCKET = "mosquito-snapshots"
