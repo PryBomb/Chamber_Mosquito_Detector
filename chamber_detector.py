@@ -397,25 +397,20 @@ class ChamberDetector:
                 species, clf_conf, probs = self.classifier.classify_crop(crop)
 
                 # Two-Model Decision Fusion:
-                # If either the 2nd stage classifier OR YOLO confirms Aedes species with high confidence
-                is_confirmed_aedes = (clf_conf >= config.CLASSIFICATION_THRESHOLD) or (yolo_conf is not None and yolo_conf >= 0.45)
+                # Case 1 – CNN >= threshold: species confirmed by classifier
+                is_cnn_confirmed = clf_conf >= config.CLASSIFICATION_THRESHOLD
+                # Case 2 – CNN < threshold but YOLO >= 0.45: detection plausible, species uncertain
+                is_borderline = (not is_cnn_confirmed) and (yolo_conf is not None and yolo_conf >= 0.45)
 
-                if is_confirmed_aedes:
-                    # Determine species (Aedes aegypti vs Aedes albopictus)
-                    if clf_conf >= config.CLASSIFICATION_THRESHOLD:
-                        species_name = species
-                    elif yolo_cls is not None:
-                        species_name = "Aedes aegypti" if yolo_cls == 0 else "Aedes albopictus"
-                    else:
-                        species_name = species
-
+                if is_cnn_confirmed:
+                    # Species determined by CNN (highest reliability path)
+                    species_name = species
                     if "aegypti" in species_name.lower():
-                        color = (0, 0, 255)  # Bright RED (BGR) for Aedes aegypti
+                        color = (0, 0, 255)       # Bright RED (BGR) for Aedes aegypti
                         clean_name = "Aedes aegypti"
                     else:
-                        color = (0, 140, 255)  # Bright ORANGE (BGR) for Aedes albopictus
+                        color = (0, 140, 255)     # Bright ORANGE (BGR) for Aedes albopictus
                         clean_name = "Aedes albopictus"
-
                     # Realistic calibrated display confidence (e.g. 78% - 96%)
                     if yolo_conf is not None:
                         blended = yolo_conf * 0.5 + clf_conf * 0.5
@@ -423,17 +418,31 @@ class ChamberDetector:
                         blended = clf_conf
                     disp_conf = min(0.965, max(config.CLASSIFICATION_THRESHOLD, blended * 0.95))
                     label = f"{clean_name}: {disp_conf*100:.1f}%"
-
                     mos_id, mos_status = self.log_detection(clean_name, disp_conf, box, frame_to_process)
                     # Append MOS-ID to on-screen label (skip for duplicates to reduce noise)
                     if mos_id and mos_status != "duplicate":
                         label = f"{label}  [{mos_id}]"
                     new_detections.append((box, label, color))
+
+                elif is_borderline:
+                    # YOLO detects an insect at >= 0.45 but CNN is below confidence threshold.
+                    # Species cannot be reliably determined from available model outputs.
+                    # Detection is still logged, tracked, counted, and snapshotted exactly as confirmed detections.
+                    color = (0, 200, 255)   # YELLOW (BGR) for species-unconfirmed detections
+                    clean_name = "Mosquito - species unconfirmed"
+                    disp_conf = float(yolo_conf)
+                    label = f"{clean_name}: {disp_conf*100:.1f}%"
+                    mos_id, mos_status = self.log_detection(clean_name, disp_conf, box, frame_to_process)
+                    if mos_id and mos_status != "duplicate":
+                        label = f"{label}  [{mos_id}]"
+                    new_detections.append((box, label, color))
+
                 else:
-                    # Non-target insect (fly, beetle, ant, Culex) -> Class 3: "Other Species"
-                    color = (255, 200, 0)  # Cyan (BGR)
+                    # Both CNN and YOLO confidence are low -> Other Species (not logged)
+                    color = (255, 200, 0)   # Cyan (BGR)
                     label = "Other Species"
                     new_detections.append((box, label, color))
+
 
             with self.lock:
                 self.active_detections = new_detections
@@ -671,7 +680,7 @@ class ChamberDetector:
                     tracked_detections.append((tracked_box, label, color))
                 detections = tracked_detections
 
-            mosquito_count = sum(1 for _, label, _ in detections if "Aedes" in label)
+            mosquito_count = sum(1 for _, label, _ in detections if "Aedes" in label or "Mosquito" in label)
             other_count = len(detections) - mosquito_count
 
             # Draw asynchronous AI detections (boxes, labels, confidence)
