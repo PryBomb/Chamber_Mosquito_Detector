@@ -72,7 +72,8 @@ class ChamberCamera:
             from picamera2 import Picamera2
             self.picam2 = Picamera2()
             cam_config = self.picam2.create_video_configuration(
-                main={"size": (self.width, self.height), "format": "RGB888"}
+                main={"size": (self.width, self.height), "format": "RGB888"},
+                controls={"FrameDurationLimits": (33333, 33333)}  # Lock to 30 FPS (33333µs = 1/30s)
             )
             self.picam2.configure(cam_config)
             self.picam2.start()
