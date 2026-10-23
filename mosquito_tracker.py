@@ -24,8 +24,9 @@ import sqlite3
 import threading
 import queue
 import json
+import csv
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict
 
 import cv2
 import numpy as np
@@ -120,6 +121,66 @@ def _similarity(hist_a, hist_b, ar_a, ar_b, norm_a, norm_b):
     return COLOR_WEIGHT * color_sim + MORPH_WEIGHT * morph_sim
 
 
+def _compute_iou(b1, b2):
+    """Computes Intersection-over-Union (IoU) of two bounding boxes (x1, y1, x2, y2)."""
+    x1 = max(b1[0], b2[0])
+    y1 = max(b1[1], b2[1])
+    x2 = min(b1[2], b2[2])
+    y2 = min(b1[3], b2[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    a1 = max(0, (b1[2] - b1[0]) * (b1[3] - b1[1]))
+    a2 = max(0, (b2[2] - b2[0]) * (b2[3] - b2[1]))
+    return inter / max(a1 + a2 - inter, 1)
+
+
+def _centroid_distance(b1, b2):
+    """Computes Euclidean distance between the centers of two bounding boxes."""
+    c1x = (b1[0] + b1[2]) / 2.0
+    c1y = (b1[1] + b1[3]) / 2.0
+    c2x = (b2[0] + b2[2]) / 2.0
+    c2y = (b2[1] + b2[3]) / 2.0
+    return float(np.sqrt((c1x - c2x) ** 2 + (c1y - c2y) ** 2))
+
+
+class ActiveMosquitoTrack:
+    """Represents a live mosquito currently being tracked inside the chamber."""
+    def __init__(self, track_id: int, mos_id: str, species: str, confidence: float,
+                 box: Tuple[int, int, int, int], crop_bgr: Optional[np.ndarray], now_str: str):
+        self.track_id = track_id
+        self.mos_id = mos_id
+        self.species = species
+        self.confidence = float(confidence)
+        self.box = box
+        self.crop = crop_bgr
+        self.first_seen = now_str
+        self.last_seen = now_str
+        self.last_seen_time = time.time()
+        self.last_db_update = self.last_seen_time
+        self.last_logged_time = self.last_seen_time
+        self.missed_frames = 0
+        self.hit_count = 1
+        self.pending_db_hits = 0
+
+    @property
+    def centroid(self) -> Tuple[float, float]:
+        x1, y1, x2, y2 = self.box
+        return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+    def update(self, box: Tuple[int, int, int, int], species: str, confidence: float,
+               crop_bgr: Optional[np.ndarray], now_str: str):
+        self.box = box
+        if confidence > self.confidence or "unconfirmed" in self.species.lower():
+            self.species = species
+        self.confidence = max(self.confidence, float(confidence))
+        if crop_bgr is not None and getattr(crop_bgr, "size", 0) > 0:
+            self.crop = crop_bgr
+        self.last_seen = now_str
+        self.last_seen_time = time.time()
+        self.missed_frames = 0
+        self.hit_count += 1
+        self.pending_db_hits += 1
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 4.  Supabase sync worker (background thread, non-blocking)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -202,6 +263,9 @@ class MosquitoTracker:
         self._cache  = self._load_cache()
         self._sync   = _SupabaseSyncWorker(db_path)
         self._sync.start()
+        self._active_tracks = {}
+        self._next_track_id = 1
+        self.last_snapshot_time = 0.0
         print(f"[MosquitoTracker] SQLite registry ready -- {len(self._cache)} known mosquito(es).")
 
     def _init_db(self):
@@ -260,6 +324,71 @@ class MosquitoTracker:
         next_idx = (row[0] or 0) + 1
         return f"MOS-{next_idx:03d}"
 
+    def _insert_new_mosquito(self, hist, ar, norm_area, species, confidence, box, snapshot_path, now):
+        conn   = sqlite3.connect(self.db_path)
+        mos_id = self._next_mos_id(conn)
+        x1, y1, x2, y2 = box if box else (0, 0, 0, 0)
+        row = {
+            "mos_id":        mos_id,
+            "species":       species,
+            "first_seen":    now,
+            "last_seen":     now,
+            "detect_count":  1,
+            "confidence":    round(confidence, 4),
+            "snapshot_path": snapshot_path or "",
+            "bbox_x1": x1, "bbox_y1": y1,
+            "bbox_x2": x2, "bbox_y2": y2,
+            "color_hist":    json.dumps(hist.tolist()),
+            "morph_ar":      round(ar, 4),
+            "morph_area":    round(norm_area, 4),
+            "synced":              0,
+            "verification_status": "unverified",
+            "model_prediction":    species,
+            "verified_species":    None,
+        }
+        conn.execute("""
+            INSERT INTO mosquito_registry
+              (mos_id, species, first_seen, last_seen, detect_count,
+               confidence, snapshot_path, bbox_x1, bbox_y1, bbox_x2, bbox_y2,
+               color_hist, morph_ar, morph_area, synced,
+               verification_status, model_prediction, verified_species)
+            VALUES
+              (:mos_id, :species, :first_seen, :last_seen, :detect_count,
+               :confidence, :snapshot_path, :bbox_x1, :bbox_y1, :bbox_x2, :bbox_y2,
+               :color_hist, :morph_ar, :morph_area, :synced,
+               :verification_status, :model_prediction, :verified_species)
+        """, row)
+        conn.commit()
+        conn.close()
+
+        cache_entry               = dict(row)
+        cache_entry["color_hist"] = hist
+        self._cache[mos_id]       = cache_entry
+
+        print(f"[MosquitoTracker] NEW  -> {mos_id}  ({species}  conf={confidence:.2f})")
+
+        if SUPABASE_ENABLED:
+            self._sync.enqueue(row, snapshot_path)
+
+        return mos_id
+
+    def _append_csv(self, timestamp, species, confidence, box, snapshot_filename, mos_id, status):
+        log_file = getattr(config, 'LOG_FILE', 'detection_log.csv')
+        file_exists = os.path.isfile(log_file)
+        try:
+            with open(log_file, mode='a', newline='') as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(["timestamp", "species", "confidence",
+                                     "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
+                                     "snapshot", "mos_id", "status"])
+                x1, y1, x2, y2 = box if box else (0, 0, 0, 0)
+                writer.writerow([timestamp, species, f"{confidence*100:.2f}%",
+                                 x1, y1, x2, y2,
+                                 snapshot_filename or "", mos_id, status])
+        except Exception as e:
+            print(f"[MosquitoTracker] CSV append error: {e}")
+
     def register(self, crop_bgr, species, confidence, box, snapshot_path=None):
         """
         Compare crop against known registry; assign/update ID accordingly.
@@ -298,68 +427,238 @@ class MosquitoTracker:
                 return best_id, "unverified"
 
             # New mosquito
-            conn   = sqlite3.connect(self.db_path)
-            mos_id = self._next_mos_id(conn)
-            x1, y1, x2, y2 = box
-            row = {
-                "mos_id":        mos_id,
-                "species":       species,
-                "first_seen":    now,
-                "last_seen":     now,
-                "detect_count":  1,
-                "confidence":    round(confidence, 4),
-                "snapshot_path": snapshot_path or "",
-                "bbox_x1": x1, "bbox_y1": y1,
-                "bbox_x2": x2, "bbox_y2": y2,
-                "color_hist":    json.dumps(hist.tolist()),
-                "morph_ar":      round(ar, 4),
-                "morph_area":    round(norm_area, 4),
-                "synced":              0,
-                "verification_status": "unverified",
-                "model_prediction":    species,
-                "verified_species":    None,
-            }
-            conn.execute("""
-                INSERT INTO mosquito_registry
-                  (mos_id, species, first_seen, last_seen, detect_count,
-                   confidence, snapshot_path, bbox_x1, bbox_y1, bbox_x2, bbox_y2,
-                   color_hist, morph_ar, morph_area, synced,
-                   verification_status, model_prediction, verified_species)
-                VALUES
-                  (:mos_id, :species, :first_seen, :last_seen, :detect_count,
-                   :confidence, :snapshot_path, :bbox_x1, :bbox_y1, :bbox_x2, :bbox_y2,
-                   :color_hist, :morph_ar, :morph_area, :synced,
-                   :verification_status, :model_prediction, :verified_species)
-            """, row)
-            conn.commit()
-            conn.close()
-
-            cache_entry               = dict(row)
-            cache_entry["color_hist"] = hist
-            self._cache[mos_id]       = cache_entry
-
-            print(f"[MosquitoTracker] NEW  -> {mos_id}  ({species}  conf={confidence:.2f})")
-
-            if SUPABASE_ENABLED:
-                self._sync.enqueue(row, snapshot_path)
-
+            mos_id = self._insert_new_mosquito(hist, ar, norm_area, species, confidence, box, snapshot_path, now)
             return mos_id, "new"
 
-    def _update_existing(self, mos_id, now, confidence):
+    def update_tracks(self, detections: List[Dict], frame: np.ndarray) -> List[Dict]:
+        """
+        Multi-mosquito spatial tracker for the chamber.
+        Tracks each individual mosquito across frames and ensures simultaneous
+        mosquitoes in the chamber receive unique, non-overlapping MOS-IDs.
+
+        Args:
+            detections: list of dicts with:
+                - "box": (x1, y1, x2, y2)
+                - "species": str
+                - "confidence": float
+                - "color": tuple (optional)
+                - "crop": np.ndarray (optional)
+            frame: full BGR frame (np.ndarray)
+
+        Returns:
+            list of dicts for all tracked mosquitoes in the current frame:
+            [ {
+                "box": (x1, y1, x2, y2),
+                "mos_id": str,
+                "species": str,
+                "confidence": float,
+                "status": "new" | "tracked",
+                "color": tuple,
+                "label": str,
+                "snapshot_path": str
+              }, ... ]
+        """
+        now_dt = datetime.now()
+        now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+        now_time = time.time()
+
+        max_dist = getattr(config, "TRACK_MAX_DISTANCE", 120)
+        iou_thresh = getattr(config, "TRACK_IOU_THRESH", 0.15)
+        max_missed = getattr(config, "TRACK_MAX_MISSED", 15)
+        log_interval = getattr(config, "LOG_INTERVAL_SEC", 5.0)
+
+        # Standardize detections
+        sanitized_dets = []
+        for d in detections:
+            box = d.get("box") if isinstance(d, dict) else d[0]
+            species = d.get("species", "Mosquito") if isinstance(d, dict) else d[1]
+            conf = float(d.get("confidence", 0.5) if isinstance(d, dict) else d[2])
+            color = d.get("color", (0, 0, 255)) if isinstance(d, dict) else (d[3] if len(d) > 3 else (0, 0, 255))
+            crop = d.get("crop", None) if isinstance(d, dict) else (d[4] if len(d) > 4 else None)
+
+            if (crop is None or getattr(crop, "size", 0) == 0) and frame is not None and getattr(frame, "size", 0) > 0:
+                x1, y1, x2, y2 = box
+                crop = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
+
+            sanitized_dets.append({
+                "box": box,
+                "species": species,
+                "confidence": conf,
+                "color": color,
+                "crop": crop
+            })
+
+        with self._lock:
+            active_track_ids = list(self._active_tracks.keys())
+
+            # Spatial matching between active tracks and detections
+            candidate_matches = []
+            for tid in active_track_ids:
+                track = self._active_tracks[tid]
+                for d_idx, det in enumerate(sanitized_dets):
+                    dbox = det["box"]
+                    iou = _compute_iou(track.box, dbox)
+                    dist = _centroid_distance(track.box, dbox)
+                    if iou >= iou_thresh or dist <= max_dist:
+                        score = (iou * 2.0) + max(0.0, 1.0 - (dist / max(max_dist, 1.0)))
+                        candidate_matches.append((score, tid, d_idx))
+
+            # Greedy 1-to-1 matching (no detection or track shared)
+            candidate_matches.sort(key=lambda x: x[0], reverse=True)
+            matched_tracks = set()
+            matched_dets = set()
+            paired = []
+            for score, tid, d_idx in candidate_matches:
+                if tid not in matched_tracks and d_idx not in matched_dets:
+                    matched_tracks.add(tid)
+                    matched_dets.add(d_idx)
+                    paired.append((tid, d_idx))
+
+            results = [None] * len(sanitized_dets)
+
+            # 1. Update matched active tracks
+            for tid, d_idx in paired:
+                track = self._active_tracks[tid]
+                det = sanitized_dets[d_idx]
+                box = det["box"]
+                species = det["species"]
+                conf = det["confidence"]
+                color = det["color"]
+                crop = det["crop"]
+
+                track.update(box, species, conf, crop, now_str)
+
+                # Periodic SQLite update
+                if now_time - track.last_db_update >= 2.0:
+                    inc = max(1, track.pending_db_hits)
+                    self._update_existing(track.mos_id, now_str, conf, increment=inc)
+                    track.pending_db_hits = 0
+                    track.last_db_update = now_time
+
+                # Periodic CSV logging
+                if now_time - track.last_logged_time >= log_interval:
+                    self._append_csv(now_str, track.species, conf, box, "", track.mos_id, "tracked")
+                    track.last_logged_time = now_time
+
+                label = f"{track.species}: {conf*100:.1f}%  [{track.mos_id}]"
+                results[d_idx] = {
+                    "box": box,
+                    "mos_id": track.mos_id,
+                    "species": track.species,
+                    "confidence": conf,
+                    "status": "tracked",
+                    "color": color,
+                    "label": label,
+                    "snapshot_path": "",
+                }
+
+            # 2. Process unmatched detections (New mosquitoes in the chamber)
+            active_mos_ids = {t.mos_id for t in self._active_tracks.values()}
+
+            for d_idx, det in enumerate(sanitized_dets):
+                if d_idx in matched_dets:
+                    continue
+
+                box = det["box"]
+                species = det["species"]
+                conf = det["confidence"]
+                color = det["color"]
+                crop = det["crop"]
+
+                # Take snapshot with cooldown
+                snap_path = ""
+                snap_filename = ""
+                if getattr(config, "AUTO_SAVE_SNAPSHOT", True) and (now_time - self.last_snapshot_time >= getattr(config, "SNAPSHOT_COOLDOWN_SEC", 2.0)):
+                    clean_sp = species.replace(" ", "_")
+                    snap_filename = f"{now_dt.strftime('%Y%m%d_%H%M%S')}_{clean_sp}_{int(conf*100)}pct.jpg"
+                    captures_dir = getattr(config, "CAPTURES_DIR", "")
+                    if captures_dir:
+                        snap_path = os.path.join(captures_dir, snap_filename)
+                        try:
+                            if frame is not None and getattr(frame, "size", 0) > 0:
+                                cv2.imwrite(snap_path, frame)
+                                self.last_snapshot_time = now_time
+                                print(f"[ALERT] Snapshot saved: {snap_filename}")
+                        except Exception as e:
+                            print(f"[MosquitoTracker] Snapshot error: {e}")
+                            snap_path = ""
+                            snap_filename = ""
+
+                # Feature extraction
+                if crop is not None and getattr(crop, "size", 0) > 0:
+                    hist = _colour_hist(crop)
+                    ar, norm_area = _morph_features(crop)
+                else:
+                    hist = np.zeros(COLOR_HIST_BINS * 2, dtype=np.float32)
+                    ar, norm_area = 1.0, 0.5
+
+                # Compare with cached mosquitoes not currently active in chamber
+                best_id = None
+                best_score = 0.0
+                for mid, entry in self._cache.items():
+                    if mid in active_mos_ids:
+                        continue  # Must NEVER reuse an active mosquito's ID!
+                    score = _similarity(hist, entry["color_hist"], ar, entry.get("morph_ar") or 1.0, norm_area, entry.get("morph_area") or 0.5)
+                    if score > best_score:
+                        best_score = score
+                        best_id = mid
+
+                if best_score >= SIMILARITY_HIGH and best_id is not None:
+                    mos_id = best_id
+                    status = "duplicate"
+                    self._update_existing(mos_id, now_str, conf)
+                else:
+                    mos_id = self._insert_new_mosquito(hist, ar, norm_area, species, conf, box, snap_path, now_str)
+                    status = "new"
+
+                # Add to active tracks
+                tid = self._next_track_id
+                self._next_track_id += 1
+                new_track = ActiveMosquitoTrack(tid, mos_id, species, conf, box, crop, now_str)
+                new_track.last_logged_time = now_time
+                self._active_tracks[tid] = new_track
+                active_mos_ids.add(mos_id)
+
+                # Log new detection to CSV
+                self._append_csv(now_str, species, conf, box, snap_filename, mos_id, status)
+
+                label = f"{species}: {conf*100:.1f}%  [{mos_id}]"
+                results[d_idx] = {
+                    "box": box,
+                    "mos_id": mos_id,
+                    "species": species,
+                    "confidence": conf,
+                    "status": status,
+                    "color": color,
+                    "label": label,
+                    "snapshot_path": snap_path,
+                }
+
+            # 3. Update unmatched tracks (missed frames)
+            for tid in active_track_ids:
+                if tid not in matched_tracks:
+                    track = self._active_tracks[tid]
+                    track.missed_frames += 1
+                    if track.missed_frames > max_missed:
+                        del self._active_tracks[tid]
+
+            return [r for r in results if r is not None]
+
+    def _update_existing(self, mos_id, now, confidence, increment=1):
         conn = sqlite3.connect(self.db_path)
         conn.execute("""
             UPDATE mosquito_registry
                SET last_seen    = ?,
-                   detect_count = detect_count + 1,
+                   detect_count = detect_count + ?,
                    confidence   = MAX(confidence, ?),
                    synced       = 0
              WHERE mos_id = ?
-        """, (now, round(confidence, 4), mos_id))
+        """, (now, increment, round(confidence, 4), mos_id))
         conn.commit()
         conn.close()
         if mos_id in self._cache:
             self._cache[mos_id]["last_seen"]    = now
-            self._cache[mos_id]["detect_count"] = self._cache[mos_id].get("detect_count", 1) + 1
+            self._cache[mos_id]["detect_count"] = self._cache[mos_id].get("detect_count", 1) + increment
 
     def get_all(self):
         conn = sqlite3.connect(self.db_path)
@@ -456,5 +755,15 @@ class MosquitoTracker:
     def get_count(self):
         return len(self._cache)
 
+    def flush(self):
+        """Flush any pending active track statistics to SQLite."""
+        with self._lock:
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            for track in self._active_tracks.values():
+                if track.pending_db_hits > 0:
+                    self._update_existing(track.mos_id, now_str, track.confidence, increment=track.pending_db_hits)
+                    track.pending_db_hits = 0
+
     def close(self):
+        self.flush()
         self._sync.stop()

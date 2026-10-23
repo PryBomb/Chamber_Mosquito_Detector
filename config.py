@@ -91,6 +91,12 @@ MORPH_WEIGHT = 0.35      # Body shape / aspect-ratio contribution
 # Colour histogram bins per channel (H and S channels of HSV)
 COLOR_HIST_BINS = 32
 
+# Multi-Mosquito Chamber Spatial Tracking
+TRACK_MAX_DISTANCE = 120    # Max pixel distance for matching moving mosquito across frames
+TRACK_MAX_MISSED   = 15     # Number of frames to retain lost track before removing (~1-2 seconds)
+TRACK_IOU_THRESH   = 0.15   # Minimum IoU for spatial overlap match
+LOG_INTERVAL_SEC   = 5.0    # Minimum interval (seconds) between periodic CSV logs for same mosquito
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Supabase Cloud Sync (optional — leave SUPABASE_ENABLED = False to skip)
 # ─────────────────────────────────────────────────────────────────────────────

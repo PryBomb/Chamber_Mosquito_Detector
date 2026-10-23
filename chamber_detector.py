@@ -371,7 +371,9 @@ class ChamberDetector:
                 candidate_boxes = self.detect_boxes(frame_to_process)
 
             # 2. Stage 2 Three-Class Recognition: Aedes aegypti, Aedes albopictus, Other Species
-            new_detections = []
+            mosquito_candidates = []
+            other_detections = []
+
             for item in candidate_boxes:
                 if len(item) == 6:
                     x1, y1, x2, y2, yolo_conf, yolo_cls = item
@@ -388,9 +390,7 @@ class ChamberDetector:
                 is_insect, morph_reason = self.check_morphology(crop)
                 if not is_insect:
                     # Screws / Solid metal -> Recognized as Class 3: "Other Species"
-                    color = (255, 200, 0)  # Cyan (BGR)
-                    label = "Other Species"
-                    new_detections.append((box, label, color))
+                    other_detections.append((box, "Other Species", (255, 200, 0)))
                     continue
 
                 # Insect Species Classification (Stage 2 CNN)
@@ -417,12 +417,13 @@ class ChamberDetector:
                     else:
                         blended = clf_conf
                     disp_conf = min(0.965, max(config.CLASSIFICATION_THRESHOLD, blended * 0.95))
-                    label = f"{clean_name}: {disp_conf*100:.1f}%"
-                    mos_id, mos_status = self.log_detection(clean_name, disp_conf, box, frame_to_process)
-                    # Append MOS-ID to on-screen label (skip for duplicates to reduce noise)
-                    if mos_id and mos_status != "duplicate":
-                        label = f"{label}  [{mos_id}]"
-                    new_detections.append((box, label, color))
+                    mosquito_candidates.append({
+                        "box": box,
+                        "species": clean_name,
+                        "confidence": disp_conf,
+                        "color": color,
+                        "crop": crop
+                    })
 
                 elif is_borderline:
                     # YOLO detects an insect at >= 0.45 but CNN is below confidence threshold.
@@ -431,21 +432,29 @@ class ChamberDetector:
                     color = (0, 200, 255)   # YELLOW (BGR) for species-unconfirmed detections
                     clean_name = "Mosquito - species unconfirmed"
                     disp_conf = float(yolo_conf)
-                    label = f"{clean_name}: {disp_conf*100:.1f}%"
-                    mos_id, mos_status = self.log_detection(clean_name, disp_conf, box, frame_to_process)
-                    if mos_id and mos_status != "duplicate":
-                        label = f"{label}  [{mos_id}]"
-                    new_detections.append((box, label, color))
+                    mosquito_candidates.append({
+                        "box": box,
+                        "species": clean_name,
+                        "confidence": disp_conf,
+                        "color": color,
+                        "crop": crop
+                    })
 
                 else:
                     # Both CNN and YOLO confidence are low -> Other Species (not logged)
-                    color = (255, 200, 0)   # Cyan (BGR)
-                    label = "Other Species"
-                    new_detections.append((box, label, color))
+                    other_detections.append((box, "Other Species", (255, 200, 0)))
 
+            if self.tracker is not None:
+                tracked_results = self.tracker.update_tracks(mosquito_candidates, frame_to_process)
+                mosquito_detections = [(r["box"], r["label"], r["color"]) for r in tracked_results]
+            else:
+                mosquito_detections = [
+                    (c["box"], f"{c['species']}: {c['confidence']*100:.1f}%", c["color"])
+                    for c in mosquito_candidates
+                ]
 
             with self.lock:
-                self.active_detections = new_detections
+                self.active_detections = mosquito_detections + other_detections
 
     def detect_boxes(self, frame):
         """
@@ -730,6 +739,8 @@ class ChamberDetector:
                 self.mode = "chamber_contrast" if self.mode == "yolo" else "yolo"
                 print(f"[INFO] Detection mode toggled to: {self.mode.upper()}")
 
+        if self.tracker is not None:
+            self.tracker.close()
         self.camera.release()
         cv2.destroyAllWindows()
         print("[INFO] Camera released. Exiting clean.")
