@@ -739,6 +739,8 @@ class ChamberDetector:
                 self.mode = "chamber_contrast" if self.mode == "yolo" else "yolo"
                 print(f"[INFO] Detection mode toggled to: {self.mode.upper()}")
 
+        self.worker_running = False
+        self.ai_thread.join(timeout=10)
         if self.tracker is not None:
             self.tracker.close()
         self.camera.release()

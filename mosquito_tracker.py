@@ -264,6 +264,7 @@ class MosquitoTracker:
         self._sync   = _SupabaseSyncWorker(db_path)
         self._sync.start()
         self._active_tracks = {}
+        self._pending_tracks = []
         self._next_track_id = 1
         self.last_snapshot_time = 0.0
         print(f"[MosquitoTracker] SQLite registry ready -- {len(self._cache)} known mosquito(es).")
@@ -555,8 +556,42 @@ class MosquitoTracker:
             # 2. Process unmatched detections (New mosquitoes in the chamber)
             active_mos_ids = {t.mos_id for t in self._active_tracks.values()}
 
+            # --- Pending stage: confirm new detections before assigning IDs ---
+            pending_needed = getattr(config, "TRACK_CONFIRM_FRAMES", 3)
+            unmatched_idx = [i for i in range(len(sanitized_dets)) if i not in matched_dets]
+            pend_candidates = []
+            for p_i, pend in enumerate(self._pending_tracks):
+                for d_idx in unmatched_idx:
+                    dbox = sanitized_dets[d_idx]["box"]
+                    iou = _compute_iou(pend["box"], dbox)
+                    dist = _centroid_distance(pend["box"], dbox)
+                    if iou >= iou_thresh or dist <= max_dist:
+                        score = (iou * 2.0) + max(0.0, 1.0 - (dist / max(max_dist, 1.0)))
+                        pend_candidates.append((score, p_i, d_idx))
+            pend_candidates.sort(key=lambda x: x[0], reverse=True)
+            used_pend = set()
+            used_dets = set()
+            new_pending = []
+            confirmed_dets = set()
+            for score, p_i, d_idx in pend_candidates:
+                if p_i in used_pend or d_idx in used_dets:
+                    continue
+                used_pend.add(p_i)
+                used_dets.add(d_idx)
+                hits = self._pending_tracks[p_i]["hits"] + 1
+                if hits >= pending_needed:
+                    confirmed_dets.add(d_idx)
+                else:
+                    new_pending.append({"box": sanitized_dets[d_idx]["box"], "hits": hits})
+            for d_idx in unmatched_idx:
+                if d_idx not in used_dets:
+                    new_pending.append({"box": sanitized_dets[d_idx]["box"], "hits": 1})
+            self._pending_tracks = new_pending
+
             for d_idx, det in enumerate(sanitized_dets):
                 if d_idx in matched_dets:
+                    continue
+                if d_idx not in confirmed_dets:
                     continue
 
                 box = det["box"]
