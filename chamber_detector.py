@@ -357,7 +357,7 @@ class ChamberDetector:
                     proc_frame = frame_to_process
                     offset_x, offset_y = 0, 0
 
-                results = self.yolo_model(proc_frame, conf=config.YOLO_CONF_THRESHOLD, imgsz=getattr(config, 'YOLO_IMGSZ', 640), agnostic_nms=True, iou=0.45, verbose=False)
+                results = self.yolo_model.track(proc_frame, persist=True, tracker='bytetrack.yaml', conf=config.YOLO_CONF_THRESHOLD, imgsz=getattr(config, 'YOLO_IMGSZ', 640), agnostic_nms=True, iou=0.45, verbose=False)
                 for r in results:
                     for b in r.boxes:
                         coords = b.xyxy.cpu().numpy()[0]
@@ -366,19 +366,24 @@ class ChamberDetector:
                         if config.MIN_BBOX_AREA <= area <= config.MAX_BBOX_AREA:
                             yolo_conf = float(b.conf[0])
                             yolo_cls = int(b.cls[0])
-                            candidate_boxes.append((x1 + offset_x, y1 + offset_y, x2 + offset_x, y2 + offset_y, yolo_conf, yolo_cls))
+                            track_id = int(b.id[0].item()) if b.id is not None else None
+                            candidate_boxes.append((x1 + offset_x, y1 + offset_y, x2 + offset_x, y2 + offset_y, yolo_conf, yolo_cls, track_id))
             else:
                 candidate_boxes = self.detect_boxes(frame_to_process)
 
             # 2. Stage 2 Three-Class Recognition: Aedes aegypti, Aedes albopictus, Other Species
             new_detections = []
             for item in candidate_boxes:
-                if len(item) == 6:
+                if len(item) == 7:
+                    x1, y1, x2, y2, yolo_conf, yolo_cls, track_id = item
+                    box = (x1, y1, x2, y2)
+                elif len(item) == 6:
                     x1, y1, x2, y2, yolo_conf, yolo_cls = item
+                    track_id = None
                     box = (x1, y1, x2, y2)
                 else:
                     box = item[:4]
-                    yolo_conf, yolo_cls = None, None
+                    yolo_conf, yolo_cls, track_id = None, None, None
 
                 crop = self.crop_box(frame_to_process, box)
                 if crop.size == 0:
