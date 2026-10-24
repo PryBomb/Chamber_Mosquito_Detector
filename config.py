@@ -100,9 +100,28 @@ LOG_INTERVAL_SEC   = 5.0    # Minimum interval (seconds) between periodic CSV lo
 # ─────────────────────────────────────────────────────────────────────────────
 # Supabase Cloud Sync (optional — leave SUPABASE_ENABLED = False to skip)
 # ─────────────────────────────────────────────────────────────────────────────
-SUPABASE_ENABLED = False
-SUPABASE_URL     = "https://wvudxhppveaeoitjcnrp.supabase.co"    # e.g. "https://xyzcompany.supabase.co"
-SUPABASE_KEY     = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind2dWR4aHBwdmVhZW9pdGpjbnJwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI1ODkwODgsImV4cCI6MjEwODE2NTA4OH0.qMqaovi8P_DUG_Bm38e7TAgDQIy3A4ngGXeXlxfchQQ"    # service-role or anon key
+SUPABASE_ENABLED = os.environ.get("SUPABASE_ENABLED", "false").strip().lower() in ("true", "1", "yes")
+SUPABASE_URL     = os.environ.get("SUPABASE_URL", "").strip()    # e.g. "https://xyzcompany.supabase.co"
+SUPABASE_KEY     = os.environ.get("SUPABASE_KEY", "").strip()    # service-role or anon key
 SUPABASE_TABLE   = "mosquito_registry"
 SUPABASE_BUCKET  = "mosquito-images"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CUSUM Activity Monitor Configuration (cusum_monitor.py)
+# ─────────────────────────────────────────────────────────────────────────────
+# Note: Provisional engineering parameters; require evaluation against empirical surveillance data.
+CUSUM_ENABLED                 = True
+CUSUM_DB_PATH                 = os.path.join(BASE_DIR, "cusum_history.db")
+CUSUM_INTERVAL_MINUTES        = 30     # Discrete evaluation interval duration (minutes)
+CUSUM_BASELINE_DAYS           = 7      # Duration of initial baseline collection period (valid days)
+CUSUM_MIN_BASELINE_OBSERVATIONS = 12   # Minimum valid 30-min observations before baseline is ready
+CUSUM_K                       = 0.5    # Reference allowance parameter (slack)
+CUSUM_H                       = 5.0    # CUSUM alert decision threshold
+CUSUM_MIN_STD                 = 0.5    # Minimum standard deviation floor to prevent division by zero
+CUSUM_MORNING_START_HOUR      = 6      # Morning window start (06:00)
+CUSUM_MORNING_END_HOUR        = 12     # Morning window end (12:00)
+CUSUM_AFTERNOON_START_HOUR    = 12     # Afternoon window start (12:00)
+CUSUM_AFTERNOON_END_HOUR      = 18     # Afternoon window end (18:00)
+CUSUM_MIN_COVERAGE_RATIO      = 0.70   # Required active monitoring ratio for valid observation
+
 

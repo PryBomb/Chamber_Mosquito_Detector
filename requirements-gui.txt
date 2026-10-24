@@ -1,0 +1,2 @@
+# Desktop GUI (MosquitoSentinel) - Windows Client Dependencies
+PySide6>=6.5.0

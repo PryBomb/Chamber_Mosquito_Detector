@@ -41,3 +41,14 @@ ENV/
 Thumbs.db
 .vscode/
 .idea/
+
+# Server backups, databases, and secrets
+*.before_*
+*.backup
+*.db
+sentinel_secret.json
+client_config.json
+cusum_history.db
+.env
+*.env
+
