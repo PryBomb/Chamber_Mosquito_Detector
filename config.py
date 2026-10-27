@@ -98,11 +98,11 @@ TRACK_IOU_THRESH   = 0.15   # Minimum IoU for spatial overlap match
 LOG_INTERVAL_SEC   = 5.0    # Minimum interval (seconds) between periodic CSV logs for same mosquito
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Supabase Cloud Sync (optional — leave SUPABASE_ENABLED = False to skip)
+# Supabase Cloud Database (Main Database)
 # ─────────────────────────────────────────────────────────────────────────────
-SUPABASE_ENABLED = os.environ.get("SUPABASE_ENABLED", "false").strip().lower() in ("true", "1", "yes")
-SUPABASE_URL     = os.environ.get("SUPABASE_URL", "").strip()    # e.g. "https://xyzcompany.supabase.co"
-SUPABASE_KEY     = os.environ.get("SUPABASE_KEY", "").strip()    # service-role or anon key
+SUPABASE_ENABLED = os.environ.get("SUPABASE_ENABLED", "true").strip().lower() in ("true", "1", "yes")
+SUPABASE_URL     = os.environ.get("SUPABASE_URL", "https://wvudxhppveaeoitjcnrp.supabase.co").strip()    # e.g. "https://xyzcompany.supabase.co"
+SUPABASE_KEY     = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind2dWR4aHBwdmVhZW9pdGpjbnJwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI1ODkwODgsImV4cCI6MjEwODE2NTA4OH0.qMqaovi8P_DUG_Bm38e7TAgDQIy3A4ngGXeXlxfchQQ").strip()    # service-role or anon key
 SUPABASE_TABLE   = "mosquito_registry"
 SUPABASE_BUCKET  = "mosquito-images"
 

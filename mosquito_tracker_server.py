@@ -225,18 +225,30 @@ class _SupabaseSyncWorker(threading.Thread):
                 except Exception as e:
                     print(f"[Supabase] Image upload failed: {e}")
 
-            payload = {k: v for k, v in row.items() if k not in _SUPABASE_EXCLUDED_KEYS}
+            mos_id = row.get("mos_id", row.get("id"))
+            payload = {
+                "id": mos_id,
+                "species": row.get("species"),
+                "confidence": float(row.get("confidence", 0.0)),
+                "first_seen": row.get("first_seen"),
+                "last_seen": row.get("last_seen"),
+                "detect_count": int(row.get("detect_count", 1)),
+                "bbox_x1": row.get("bbox_x1"),
+                "bbox_y1": row.get("bbox_y1"),
+                "bbox_x2": row.get("bbox_x2"),
+                "bbox_y2": row.get("bbox_y2"),
+            }
             if remote_url:
                 payload["snapshot_url"] = remote_url
             try:
-                supa.table(SUPABASE_TABLE).upsert(payload, on_conflict="mos_id").execute()
+                supa.table(SUPABASE_TABLE).upsert(payload, on_conflict="id").execute()
                 conn = sqlite3.connect(self.db_path)
-                conn.execute("UPDATE mosquito_registry SET synced=1 WHERE mos_id=?", (row["mos_id"],))
+                conn.execute("UPDATE mosquito_registry SET synced=1 WHERE mos_id=?", (mos_id,))
                 conn.commit()
                 conn.close()
-                print(f"[Supabase] Synced {row['mos_id']}")
+                print(f"[Supabase] Synced {mos_id}")
             except Exception as e:
-                print(f"[Supabase] Upsert failed for {row['mos_id']}: {e}")
+                print(f"[Supabase] Upsert failed for {mos_id}: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -258,11 +270,15 @@ class MosquitoTracker:
 
     def __init__(self, db_path=DB_PATH):
         self.db_path = db_path
+        self.is_production_db = bool(os.path.abspath(db_path) == os.path.abspath(DB_PATH))
         self._lock   = threading.Lock()
         self._init_db()
         self._cache  = self._load_cache()
-        self._sync   = _SupabaseSyncWorker(db_path)
-        self._sync.start()
+        if SUPABASE_ENABLED and self.is_production_db:
+            self._sync = _SupabaseSyncWorker(db_path)
+            self._sync.start()
+        else:
+            self._sync = None
         self._active_tracks = {}
         self._pending_tracks = []
         self._next_track_id = 1
@@ -309,20 +325,65 @@ class MosquitoTracker:
                 print(f"[MosquitoTracker] Failed to restore isolation level: {iso_err}")
 
     def _load_cache(self):
+        cache = {}
+        # If Supabase is enabled and running against the production DB, load records from Supabase into cache
+        if SUPABASE_ENABLED and SUPABASE_URL and SUPABASE_KEY and getattr(self, "is_production_db", False):
+            try:
+                from supabase import create_client
+                supa = create_client(SUPABASE_URL, SUPABASE_KEY)
+                res = supa.table(SUPABASE_TABLE).select("*").execute()
+                for r in res.data:
+                    mos_id = r.get("id")
+                    if mos_id:
+                        cache[mos_id] = {
+                            "mos_id": mos_id,
+                            "species": r.get("species", "Mosquito - species unconfirmed"),
+                            "first_seen": r.get("first_seen"),
+                            "last_seen": r.get("last_seen"),
+                            "detect_count": int(r.get("detect_count", 1)),
+                            "confidence": float(r.get("confidence", 0.8)),
+                            "color_hist": np.zeros(64, dtype=np.float32),
+                            "morph_ar": 1.0,
+                            "morph_area": 0.5,
+                            "snapshot_path": r.get("snapshot_url", ""),
+                        }
+                if cache:
+                    print(f"[MosquitoTracker] Loaded {len(cache)} record(s) from Supabase cloud database.")
+            except Exception as e:
+                print(f"[MosquitoTracker] Warning: could not load initial cache from Supabase ({e}); using SQLite.")
+
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT * FROM mosquito_registry").fetchall()
         conn.close()
-        cache = {}
         for r in rows:
             d = dict(r)
-            d["color_hist"] = np.array(json.loads(d["color_hist"]), dtype=np.float32)
+            try:
+                d["color_hist"] = np.array(json.loads(d["color_hist"]), dtype=np.float32)
+            except Exception:
+                d["color_hist"] = np.zeros(64, dtype=np.float32)
             cache[d["mos_id"]] = d
         return cache
 
     def _next_mos_id(self, conn):
+        max_idx = 0
         row = conn.execute("SELECT MAX(id) FROM mosquito_registry").fetchone()
-        next_idx = (row[0] or 0) + 1
+        if row and row[0]:
+            max_idx = max(max_idx, int(row[0]))
+        for mid in self._cache.keys():
+            if mid.startswith("MOS-") and not mid.startswith("MOS-LEGACY-"):
+                try:
+                    num = int(mid.split("-")[1])
+                    max_idx = max(max_idx, num)
+                except Exception:
+                    pass
+            elif mid.startswith("MOS-LEGACY-"):
+                try:
+                    num = int(mid.split("-")[2])
+                    max_idx = max(max_idx, num)
+                except Exception:
+                    pass
+        next_idx = max_idx + 1
         return f"MOS-{next_idx:03d}"
 
     def _insert_new_mosquito(self, hist, ar, norm_area, species, confidence, box, snapshot_path, now):
@@ -368,7 +429,7 @@ class MosquitoTracker:
 
         print(f"[MosquitoTracker] NEW  -> {mos_id}  ({species}  conf={confidence:.2f})")
 
-        if SUPABASE_ENABLED:
+        if SUPABASE_ENABLED and self._sync is not None:
             self._sync.enqueue(row, snapshot_path)
 
         return mos_id
@@ -707,6 +768,17 @@ class MosquitoTracker:
             self._cache[mos_id]["detect_count"] = self._cache[mos_id].get("detect_count", 1) + increment
             if species and "unconfirmed" not in species.lower():
                 self._cache[mos_id]["species"] = species
+
+        if SUPABASE_ENABLED and self._sync is not None:
+            update_payload = {
+                "mos_id": mos_id,
+                "species": species or (self._cache.get(mos_id, {}).get("species")),
+                "confidence": confidence,
+                "first_seen": self._cache.get(mos_id, {}).get("first_seen", now),
+                "last_seen": now,
+                "detect_count": self._cache.get(mos_id, {}).get("detect_count", 1),
+            }
+            self._sync.enqueue(update_payload)
 
     def get_all(self):
         conn = sqlite3.connect(self.db_path)

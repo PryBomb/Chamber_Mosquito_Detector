@@ -227,27 +227,54 @@ class SentinelStatusHandler(BaseHTTPRequestHandler):
 
         detector = self.server.detector
         tracker = getattr(detector, "tracker", None) if detector else None
+        limit = 500
+        if "limit" in params:
+            try:
+                limit = max(1, min(1000, int(params["limit"][0])))
+            except (ValueError, IndexError):
+                pass
+
+        date_filter = params.get("date", [None])[0]
+
         db_path = getattr(detector, "db_path", None)
         if not db_path and tracker is not None:
             db_path = getattr(tracker, "db_path", None)
         if not db_path:
+            db_path = getattr(self.server, "db_path", None)
+        if not db_path:
             import config
             db_path = getattr(config, "TRACKER_DB_PATH", "mosquito_registry.db")
+
+        import config
+        prod_db_path = getattr(config, "TRACKER_DB_PATH", "mosquito_registry.db")
+        is_prod = (os.path.abspath(db_path) == os.path.abspath(prod_db_path))
+
+        # 1. Try Supabase cloud database if enabled and running in production
+        if is_prod and getattr(config, "SUPABASE_ENABLED", False) and getattr(config, "SUPABASE_URL", "") and getattr(config, "SUPABASE_KEY", ""):
+            try:
+                from supabase import create_client
+                supa = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+                q = supa.table(config.SUPABASE_TABLE).select("*").order("first_seen", desc=True).limit(limit)
+                if date_filter:
+                    clean_date = date_filter.strip()
+                    q = q.ilike("first_seen", f"{clean_date}%")
+                res = q.execute()
+                records = []
+                for r in res.data:
+                    rec = dict(r)
+                    rec["mos_id"] = r.get("id")
+                    records.append(rec)
+                self._send_json_response(200, {"total": len(records), "records": records, "source": "supabase"})
+                return
+            except Exception:
+                # Fall back to local SQLite database
+                pass
 
         if not os.path.isfile(db_path):
             self._send_json_response(200, {"total": 0, "records": []})
             return
 
         try:
-            limit = 500
-            if "limit" in params:
-                try:
-                    limit = max(1, min(1000, int(params["limit"][0])))
-                except (ValueError, IndexError):
-                    pass
-
-            date_filter = params.get("date", [None])[0]
-
             uri = f"file:{os.path.abspath(db_path)}?mode=ro"
             conn = sqlite3.connect(uri, uri=True, timeout=1.0)
             conn.row_factory = sqlite3.Row
@@ -348,7 +375,11 @@ class SentinelStatusHandler(BaseHTTPRequestHandler):
                 import config
                 db_path = getattr(config, "TRACKER_DB_PATH", "mosquito_registry.db")
 
-            registry_total = self.server.get_cached_registry_count(db_path)
+            registry_total = None
+            if tracker is not None and hasattr(tracker, "_cache") and len(tracker._cache) > 0:
+                registry_total = len(tracker._cache)
+            else:
+                registry_total = self.server.get_cached_registry_count(db_path)
 
             # Optional CUSUM statistical monitor status
             cusum_data = None

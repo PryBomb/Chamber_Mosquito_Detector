@@ -1613,7 +1613,24 @@ if PYSIDE6_AVAILABLE:
             except Exception:
                 records = None
 
-            # 2. If remote unreachable, fallback to local SQLite if it exists
+            # 2. If remote unreachable, query Supabase cloud database directly if enabled
+            if records is None:
+                try:
+                    import config
+                    if getattr(config, "SUPABASE_ENABLED", False) and getattr(config, "SUPABASE_URL", "") and getattr(config, "SUPABASE_KEY", ""):
+                        from supabase import create_client
+                        supa = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+                        res = supa.table(config.SUPABASE_TABLE).select("*").order("first_seen", desc=True).limit(1000).execute()
+                        if res.data:
+                            records = []
+                            for r in res.data:
+                                rec = dict(r)
+                                rec["mos_id"] = r.get("id")
+                                records.append(rec)
+                except Exception as e:
+                    records = None
+
+            # 3. If still None, fallback to local SQLite if it exists
             if records is None:
                 try:
                     import sqlite3
