@@ -402,6 +402,12 @@ class ChamberDetector:
         self.status_server = None
         self.status_server_thread = None
 
+        # Thread-safe Preview Stream buffer for remote GUI (640x360 or full resolution)
+        self.preview_lock = threading.Lock()
+        self.latest_preview_frame = None
+        self.latest_preview_time = None
+        self.latest_preview_seq = 0
+
         # CUSUM Activity Monitor & 30-min Interval Accumulator
         self.cusum_monitor = None
         self.cusum_accumulator = None
@@ -578,9 +584,12 @@ class ChamberDetector:
                     if "aegypti" in species_name.lower():
                         color = (0, 0, 255)       # Bright RED (BGR) for Aedes aegypti
                         clean_name = "Aedes aegypti"
-                    else:
+                    elif "albopictus" in species_name.lower():
                         color = (0, 140, 255)     # Bright ORANGE (BGR) for Aedes albopictus
                         clean_name = "Aedes albopictus"
+                    else:
+                        color = (0, 200, 255)     # YELLOW for unconfirmed species
+                        clean_name = "Mosquito - species unconfirmed"
                     # Realistic calibrated display confidence (e.g. 78% - 96%)
                     if yolo_conf is not None:
                         blended = yolo_conf * 0.5 + clf_conf * 0.5
@@ -826,6 +835,27 @@ class ChamberDetector:
 
         return mos_id, mos_status
 
+    def get_latest_preview_jpeg(self, width: int = 640, height: int = 360, quality: int = 80) -> Optional[Tuple[bytes, float, int]]:
+        """
+        Returns (jpeg_bytes, timestamp, seq) of the latest annotated preview frame.
+        Supports fast preview downscaling (e.g. 640x360) without modifying the 1280x720 detector resolution.
+        """
+        with self.preview_lock:
+            if self.latest_preview_frame is None:
+                return None
+            frame = self.latest_preview_frame.copy()
+            ts = self.latest_preview_time
+            seq = self.latest_preview_seq
+
+        fh, fw = frame.shape[:2]
+        if width > 0 and height > 0 and (fw != width or fh != height):
+            frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
+
+        success, encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+        if not success:
+            return None
+        return encoded.tobytes(), ts, seq
+
     def run(self):
         print("\n=======================================================")
         print(" Mosquito Chamber Detection System (Raspi HQ Camera)")
@@ -908,6 +938,12 @@ class ChamberDetector:
                 cv2.rectangle(display, (0, h - 25), (w, h), (20, 20, 20), -1)
                 cv2.putText(display, "[C] Calibrate Baseline (Zero Noise) | [M] Toggle Mode | [S] Save | [Q] Quit",
                             (15, h - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+
+                # Update live preview buffer for LAN stream serving
+                with self.preview_lock:
+                    self.latest_preview_frame = display
+                    self.latest_preview_time = now
+                    self.latest_preview_seq += 1
 
                 cv2.imshow(window_name, display)
 

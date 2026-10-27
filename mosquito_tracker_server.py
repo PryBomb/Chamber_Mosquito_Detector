@@ -532,7 +532,7 @@ class MosquitoTracker:
                 # Periodic SQLite update
                 if now_time - track.last_db_update >= 2.0:
                     inc = max(1, track.pending_db_hits)
-                    self._update_existing(track.mos_id, now_str, conf, increment=inc)
+                    self._update_existing(track.mos_id, now_str, conf, increment=inc, species=track.species)
                     track.pending_db_hits = 0
                     track.last_db_update = now_time
 
@@ -641,7 +641,7 @@ class MosquitoTracker:
                 if best_score >= SIMILARITY_HIGH and best_id is not None:
                     mos_id = best_id
                     status = "duplicate"
-                    self._update_existing(mos_id, now_str, conf)
+                    self._update_existing(mos_id, now_str, conf, species=species)
                 else:
                     mos_id = self._insert_new_mosquito(hist, ar, norm_area, species, conf, box, snap_path, now_str)
                     status = "new"
@@ -679,21 +679,34 @@ class MosquitoTracker:
 
             return [r for r in results if r is not None]
 
-    def _update_existing(self, mos_id, now, confidence, increment=1):
+    def _update_existing(self, mos_id, now, confidence, increment=1, species=None):
         conn = sqlite3.connect(self.db_path)
-        conn.execute("""
-            UPDATE mosquito_registry
-               SET last_seen    = ?,
-                   detect_count = detect_count + ?,
-                   confidence   = MAX(confidence, ?),
-                   synced       = 0
-             WHERE mos_id = ?
-        """, (now, increment, round(confidence, 4), mos_id))
+        if species and "unconfirmed" not in species.lower():
+            conn.execute("""
+                UPDATE mosquito_registry
+                   SET last_seen    = ?,
+                       detect_count = detect_count + ?,
+                       confidence   = MAX(confidence, ?),
+                       species      = CASE WHEN species LIKE '%unconfirmed%' THEN ? ELSE species END,
+                       synced       = 0
+                 WHERE mos_id = ?
+            """, (now, increment, round(confidence, 4), species, mos_id))
+        else:
+            conn.execute("""
+                UPDATE mosquito_registry
+                   SET last_seen    = ?,
+                       detect_count = detect_count + ?,
+                       confidence   = MAX(confidence, ?),
+                       synced       = 0
+                 WHERE mos_id = ?
+            """, (now, increment, round(confidence, 4), mos_id))
         conn.commit()
         conn.close()
         if mos_id in self._cache:
             self._cache[mos_id]["last_seen"]    = now
             self._cache[mos_id]["detect_count"] = self._cache[mos_id].get("detect_count", 1) + increment
+            if species and "unconfirmed" not in species.lower():
+                self._cache[mos_id]["species"] = species
 
     def get_all(self):
         conn = sqlite3.connect(self.db_path)

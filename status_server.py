@@ -23,6 +23,7 @@ import sqlite3
 import threading
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 from socketserver import ThreadingMixIn
 from typing import Optional, Tuple, Dict, Any
 
@@ -77,6 +78,18 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
             return self._cached_registry_count
 
 
+def _parse_preview_dimensions(params: Dict[str, list]) -> Tuple[int, int]:
+    """Parses and clamps preview dimensions to 160..1280 (w) and 90..720 (h)."""
+    try:
+        w = int(params.get("width", params.get("w", [640]))[0])
+        h = int(params.get("height", params.get("h", [360]))[0])
+        w = max(160, min(1280, w))
+        h = max(90, min(720, h))
+    except (ValueError, IndexError, TypeError):
+        w, h = 640, 360
+    return w, h
+
+
 class SentinelStatusHandler(BaseHTTPRequestHandler):
     """
     Handles read-only requests. Subclasses BaseHTTPRequestHandler to guarantee
@@ -84,6 +97,7 @@ class SentinelStatusHandler(BaseHTTPRequestHandler):
     """
 
     server: ThreadedHTTPServer
+    _parse_preview_dimensions = staticmethod(_parse_preview_dimensions)
 
     def log_message(self, format, *args):
         """Silence per-request access logging to avoid terminal clutter."""
@@ -121,12 +135,177 @@ class SentinelStatusHandler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
+    def _handle_frame_jpg(self, params: Dict[str, list]):
+        if not self._check_auth():
+            self._send_json_response(401, {"error": "Unauthorized", "message": "Missing or invalid X-Sentinel-Token."})
+            return
+
+        detector = self.server.detector
+        if detector is None or not hasattr(detector, "get_latest_preview_jpeg"):
+            self._send_json_response(503, {"error": "Service Unavailable", "message": "Preview stream not available."})
+            return
+
+        w, h = _parse_preview_dimensions(params)
+
+        ret = detector.get_latest_preview_jpeg(width=w, height=h)
+        if ret is None:
+            self._send_json_response(503, {"error": "Service Unavailable", "message": "Waiting for camera frame."})
+            return
+
+        jpeg_bytes, ts, seq = ret
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(jpeg_bytes)))
+            self.send_header("X-Frame-Timestamp", f"{ts:.4f}")
+            self.send_header("X-Frame-Index", str(seq))
+            det_fps = getattr(detector, "fps", None)
+            if det_fps is not None:
+                self.send_header("X-Detector-FPS", f"{det_fps:.1f}")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Expose-Headers", "X-Frame-Timestamp, X-Frame-Index, X-Detector-FPS")
+            self.end_headers()
+            self.wfile.write(jpeg_bytes)
+        except ConnectionError:
+            pass
+
+    def _handle_stream_mjpg(self, params: Dict[str, list]):
+        if not self._check_auth():
+            self._send_json_response(401, {"error": "Unauthorized", "message": "Missing or invalid X-Sentinel-Token."})
+            return
+
+        detector = self.server.detector
+        if detector is None or not hasattr(detector, "get_latest_preview_jpeg"):
+            self._send_json_response(503, {"error": "Service Unavailable", "message": "Preview stream not available."})
+            return
+
+        w, h = _parse_preview_dimensions(params)
+
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=--frame")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            last_seq = -1
+            while getattr(self.server, "is_serving", True):
+                cur_seq = getattr(detector, "latest_preview_seq", None)
+                if cur_seq is not None and cur_seq == last_seq:
+                    time.sleep(0.02)
+                    continue
+                ret = detector.get_latest_preview_jpeg(width=w, height=h)
+                if ret is None:
+                    time.sleep(0.04)
+                    continue
+                jpeg_bytes, ts, seq = ret
+                if seq == last_seq:
+                    time.sleep(0.015)
+                    continue
+                last_seq = seq
+                part_header = (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(jpeg_bytes)).encode("ascii") + b"\r\n"
+                    b"X-Frame-Timestamp: " + f"{ts:.4f}".encode("ascii") + b"\r\n"
+                    b"X-Frame-Index: " + str(seq).encode("ascii") + b"\r\n\r\n"
+                )
+                self.wfile.write(part_header + jpeg_bytes + b"\r\n")
+                self.wfile.flush()
+        except ConnectionError:
+            pass
+
+    def _handle_registry(self, params: Dict[str, list]):
+        if not self._check_auth():
+            self._send_json_response(401, {"error": "Unauthorized", "message": "Missing or invalid X-Sentinel-Token."})
+            return
+
+        detector = self.server.detector
+        tracker = getattr(detector, "tracker", None) if detector else None
+        db_path = getattr(detector, "db_path", None)
+        if not db_path and tracker is not None:
+            db_path = getattr(tracker, "db_path", None)
+        if not db_path:
+            import config
+            db_path = getattr(config, "TRACKER_DB_PATH", "mosquito_registry.db")
+
+        if not os.path.isfile(db_path):
+            self._send_json_response(200, {"total": 0, "records": []})
+            return
+
+        try:
+            limit = 500
+            if "limit" in params:
+                try:
+                    limit = max(1, min(1000, int(params["limit"][0])))
+                except (ValueError, IndexError):
+                    pass
+
+            date_filter = params.get("date", [None])[0]
+
+            uri = f"file:{os.path.abspath(db_path)}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+
+            cur.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='mosquito_registry'")
+            if cur.fetchone()[0] == 0:
+                conn.close()
+                self._send_json_response(200, {"total": 0, "records": []})
+                return
+
+            if date_filter:
+                clean_date = date_filter.strip()
+                cur.execute(
+                    "SELECT id, mos_id, species, first_seen, last_seen, detect_count, "
+                    "confidence, snapshot_path, verification_status "
+                    "FROM mosquito_registry "
+                    "WHERE first_seen LIKE ? OR last_seen LIKE ? "
+                    "ORDER BY id DESC LIMIT ?",
+                    (f"{clean_date}%", f"{clean_date}%", limit)
+                )
+            else:
+                cur.execute(
+                    "SELECT id, mos_id, species, first_seen, last_seen, detect_count, "
+                    "confidence, snapshot_path, verification_status "
+                    "FROM mosquito_registry "
+                    "ORDER BY id DESC LIMIT ?",
+                    (limit,)
+                )
+
+            rows = cur.fetchall()
+            conn.close()
+
+            records = [dict(r) for r in rows]
+            self._send_json_response(200, {"total": len(records), "records": records})
+        except Exception as e:
+            self._send_json_response(500, {"error": "Database Error", "detail": "Could not read registry"})
+
     def do_GET(self):
         try:
-            # Strictly serve only /api/status
-            path = self.path.split("?")[0].rstrip("/")
+            parsed = urlparse(self.path)
+            path = parsed.path.rstrip("/")
+            params = parse_qs(parsed.query)
+
+            if path == "/api/frame.jpg":
+                self._handle_frame_jpg(params)
+                return
+
+            if path == "/api/stream.mjpg":
+                self._handle_stream_mjpg(params)
+                return
+
+            if path == "/api/registry":
+                self._handle_registry(params)
+                return
+
             if path != "/api/status":
-                self._send_json_response(404, {"error": "Not Found", "message": "Only /api/status is exposed."})
+                self._send_json_response(404, {"error": "Not Found", "message": "Endpoint not found."})
                 return
 
             if not self._check_auth():

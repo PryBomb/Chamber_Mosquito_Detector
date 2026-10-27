@@ -31,13 +31,14 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
 try:
-    from PySide6.QtCore import Qt, QTimer, QSize, QThread, Signal, Slot, QByteArray, QPointF, QRectF, QUrl, QDate
-    from PySide6.QtGui import (QColor, QIcon, QPainter, QPen, QBrush, QPainterPath, QPixmap, QLinearGradient,
+    from PySide6.QtCore import Qt, QTimer, QSize, QThread, Signal, Slot, QByteArray, QPointF, QRectF, QRect, QUrl, QDate
+    from PySide6.QtGui import (QColor, QIcon, QPainter, QPen, QBrush, QPainterPath, QPixmap, QImage, QLinearGradient,
                                QRadialGradient, QDesktopServices)
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
         QStackedWidget, QPushButton, QLabel, QFrame, QTableWidget, QTableWidgetItem,
         QHeaderView, QComboBox, QScrollArea, QDateEdit, QAbstractItemView, QGraphicsDropShadowEffect,
+        QDialog, QFileDialog, QMessageBox,
     )
     PYSIDE6_AVAILABLE = True
 except ImportError:
@@ -175,6 +176,152 @@ if PYSIDE6_AVAILABLE:
                 self._wake.wait(interval)
                 self._wake.clear()
 
+    class FrameFetchWorker(QThread):
+        """Fetches /api/frame.jpg with low latency; emits QImage and diagnostics without touching Qt widgets."""
+        sig_frame_received = Signal(QImage, float)   # (image, fetch_duration_sec)
+        sig_diagnostics_updated = Signal(dict)       # (diagnostics_dict)
+        sig_stale_dropped = Signal(int)              # (dropped_seq)
+        sig_frame_error = Signal(str, str)           # (error_type, description)
+
+        def __init__(self, config: Dict[str, Any], parent=None):
+            super().__init__(parent)
+            self.config = config
+            self._running = True
+            self._paused = True
+            self._wake = threading.Event()
+            self._last_emitted_seq: int = -1
+            self._last_arrival_time: float = 0.0
+            self._dropped_stale_count: int = 0
+
+        def pause(self):
+            self._paused = True
+
+        def resume(self):
+            self._paused = False
+            self._wake.set()
+
+        def stop(self):
+            self._running = False
+            self._paused = False
+            self._wake.set()
+
+        def fetch_now(self):
+            self._wake.set()
+
+        def run(self):
+            host = self.config.get("pi_host", "127.0.0.1")
+            port = self.config.get("pi_port", 8080)
+            token = self.config.get("token", "")
+            timeout = float(self.config.get("timeout_sec", 2.0))
+            # Responsive target interval: default 0.05s (~20 FPS) for smooth live preview
+            interval = float(self.config.get("preview_interval_sec", 0.05))
+            w = int(self.config.get("preview_width", 0))
+            h = int(self.config.get("preview_height", 0))
+            if w > 0 and h > 0:
+                url = f"http://{host}:{port}/api/frame.jpg?width={w}&height={h}"
+            else:
+                url = f"http://{host}:{port}/api/frame.jpg"
+            host_port = f"{host}:{port}"
+
+            while self._running:
+                if self._paused:
+                    self._wake.wait(0.5)
+                    self._wake.clear()
+                    continue
+
+                t0 = time.perf_counter()
+                try:
+                    req = urllib.request.Request(url, method="GET")
+                    if token:
+                        req.add_header("X-Sentinel-Token", token)
+                    req.add_header("Cache-Control", "no-cache, no-store")
+                    req.add_header("Pragma", "no-cache")
+
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        status_code = resp.status
+                        if status_code == 200:
+                            raw_bytes = resp.read()
+                            t_dl = time.perf_counter()
+                            dl_ms = (t_dl - t0) * 1000.0
+
+                            # Parse server diagnostics headers if provided
+                            server_ts_hdr = resp.headers.get("X-Frame-Timestamp")
+                            frame_seq_hdr = resp.headers.get("X-Frame-Index")
+                            det_fps_hdr = resp.headers.get("X-Detector-FPS")
+
+                            server_ts = float(server_ts_hdr) if server_ts_hdr else None
+                            frame_seq = int(frame_seq_hdr) if frame_seq_hdr and frame_seq_hdr.isdigit() else None
+                            det_fps = float(det_fps_hdr) if det_fps_hdr else None
+
+                            t_dec_start = time.perf_counter()
+                            image = QImage()
+                            if image.loadFromData(raw_bytes) and not image.isNull():
+                                t_dec_end = time.perf_counter()
+                                dec_ms = (t_dec_end - t_dec_start) * 1000.0
+                                total_fetch_ms = (t_dec_end - t0) * 1000.0
+                                frame_age_ms = (time.time() - server_ts) * 1000.0 if server_ts is not None else None
+
+                                # Discard stale / duplicate buffered frames (Requirement 2 & 3)
+                                if frame_seq is not None and frame_seq <= self._last_emitted_seq:
+                                    self._dropped_stale_count += 1
+                                    self.sig_stale_dropped.emit(frame_seq)
+                                    continue
+
+                                if frame_seq is not None:
+                                    self._last_emitted_seq = frame_seq
+
+                                now_arr = time.time()
+                                intv_ms = (now_arr - self._last_arrival_time) * 1000.0 if self._last_arrival_time > 0 else 0.0
+                                self._last_arrival_time = now_arr
+
+                                diag = {
+                                    "download_ms": dl_ms,
+                                    "decode_ms": dec_ms,
+                                    "total_fetch_ms": total_fetch_ms,
+                                    "frame_age_ms": frame_age_ms,
+                                    "interval_ms": intv_ms,
+                                    "frame_seq": frame_seq,
+                                    "detector_fps": det_fps,
+                                    "dropped_stale": self._dropped_stale_count,
+                                    "width": image.width(),
+                                    "height": image.height(),
+                                }
+                                self.sig_frame_received.emit(image, total_fetch_ms / 1000.0)
+                                self.sig_diagnostics_updated.emit(diag)
+                            else:
+                                self.sig_frame_error.emit("decode_error", "Received picture failed to decode (invalid JPEG data)")
+                        else:
+                            self.sig_frame_error.emit("http_error", f"HTTP {status_code}")
+
+                except urllib.error.HTTPError as he:
+                    if he.code == 401:
+                        self.sig_frame_error.emit("unauthorized", "Unauthorized: X-Sentinel-Token invalid or missing (401)")
+                    elif he.code == 404:
+                        self.sig_frame_error.emit("not_found", "Endpoint /api/frame.jpg not found (404)")
+                    elif he.code == 503:
+                        self.sig_frame_error.emit("no_frame", "Waiting for first frame from camera (503)")
+                    else:
+                        self.sig_frame_error.emit("http_error", f"HTTP {he.code}: {he.reason}")
+                except urllib.error.URLError as ue:
+                    reason_str = str(ue.reason)
+                    low = reason_str.lower()
+                    if "timed out" in low or "timeout" in low:
+                        self.sig_frame_error.emit("timeout", f"Connection timed out: {host_port}")
+                    elif "connectionrefused" in low or "actively refused" in low or "refused" in low:
+                        self.sig_frame_error.emit("connection_refused", f"Cannot connect to {host_port}")
+                    else:
+                        self.sig_frame_error.emit("network_error", reason_str)
+                except (TimeoutError, socket.timeout):
+                    self.sig_frame_error.emit("timeout", f"Connection timed out: {host_port}")
+                except Exception as ex:
+                    self.sig_frame_error.emit("unknown_error", str(ex))
+
+                if self._running and not self._paused:
+                    elapsed = time.perf_counter() - t0
+                    wait_time = max(0.005, interval - elapsed)
+                    self._wake.wait(wait_time)
+                    self._wake.clear()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2b. Analytics data store (pure Python, no Qt, read-only)
@@ -193,7 +340,7 @@ def normalize_species(v) -> Optional[str]:
     if v is None:
         return None
     s = str(v).strip()
-    return None if s.lower() in UNCONFIRMED_LABELS else s
+    return None if (s.lower() in UNCONFIRMED_LABELS or "unconfirmed" in s.lower() or "unknown" in s.lower()) else s
 
 
 def _to_naive_dt(dt: Optional[datetime]) -> datetime:
@@ -955,60 +1102,380 @@ if PYSIDE6_AVAILABLE:
             self.tracks.set_empty_text("Waiting for the detector", "Tracked mosquitoes will appear here once the connection is restored.")
             self.tracks.set_rows([])
 
-    class LiveDetectionPage(QWidget):
-        """Placeholder for the Stage 6 live video stream."""
+    class VideoViewport(QFrame):
+        """Displays the Pi camera frame scaled to fit with aspect ratio kept, or status/error messages."""
 
         def __init__(self, parent=None):
             super().__init__(parent)
+            self.setMinimumSize(320, 180)
+            self._pixmap: Optional[QPixmap] = None
+            self._is_stale: bool = False
+            self._stale_note: str = ""
+            self._error_title: str = "Connecting to video stream…"
+            self._error_subtitle: str = "Waiting for live frame from http://<host>:<port>/api/frame.jpg."
+
+        def set_frame(self, pixmap: QPixmap):
+            self._pixmap = pixmap
+            self._is_stale = False
+            self._stale_note = ""
+            self.update()
+
+        def set_stale(self, is_stale: bool, note: str = ""):
+            self._is_stale = is_stale
+            self._stale_note = note
+            self.update()
+
+        def set_error_message(self, title: str, subtitle: str):
+            self._error_title = title
+            self._error_subtitle = subtitle
+            self.update()
+
+        def has_frame(self) -> bool:
+            return self._pixmap is not None and not self._pixmap.isNull()
+
+        def paintEvent(self, _event):
+            p = QPainter(self)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+
+            w, h = self.width(), self.height()
+            rect = QRectF(0, 0, w, h)
+
+            # Dark gradient background
+            bg = QLinearGradient(0, 0, w, h)
+            bg.setColorAt(0.0, QColor("#17313A"))
+            bg.setColorAt(1.0, QColor("#25465A"))
+            p.setPen(Qt.NoPen)
+            p.setBrush(bg)
+            p.drawRoundedRect(rect, 14, 14)
+
+            if self.has_frame():
+                pw, ph = self._pixmap.width(), self._pixmap.height()
+                if pw > 0 and ph > 0:
+                    p.save()
+                    clip_path = QPainterPath()
+                    clip_path.addRoundedRect(rect, 14, 14)
+                    p.setClipPath(clip_path)
+
+                    scale = min((w - 8) / pw, (h - 8) / ph)
+                    dw, dh = int(pw * scale), int(ph * scale)
+                    dx, dy = (w - dw) // 2, (h - dh) // 2
+                    target_rect = QRect(dx, dy, dw, dh)
+
+                    p.drawPixmap(target_rect, self._pixmap)
+                    p.restore()
+
+                    if self._is_stale:
+                        p.save()
+                        stale_text = f"⚠ Stale · {self._stale_note}" if self._stale_note else "⚠ Stale frame"
+                        f = p.font()
+                        f.setPointSize(10)
+                        f.setBold(True)
+                        p.setFont(f)
+                        fm = p.fontMetrics()
+                        tw = fm.horizontalAdvance(stale_text)
+                        box_rect = QRectF(16, 16, tw + 24, 28)
+                        p.setPen(QColor(183, 121, 31, 200))
+                        p.setBrush(QColor(25, 40, 48, 220))
+                        p.drawRoundedRect(box_rect, 8, 8)
+                        p.setPen(QColor("#FBEFD5"))
+                        p.drawText(box_rect, Qt.AlignCenter, stale_text)
+                        p.restore()
+            else:
+                p.save()
+                f_title = p.font()
+                f_title.setPointSize(15)
+                f_title.setBold(True)
+                p.setFont(f_title)
+                p.setPen(QColor("#E6F1F3"))
+                p.drawText(QRectF(24, h // 2 - 32, w - 48, 30), Qt.AlignCenter, self._error_title)
+
+                f_sub = p.font()
+                f_sub.setPointSize(11)
+                p.setFont(f_sub)
+                p.setPen(QColor("#B8CDD2"))
+                p.drawText(QRectF(32, h // 2 + 4, w - 64, 48), Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap, self._error_subtitle)
+                p.restore()
+
+    class ExpandedCameraDialog(QDialog):
+        """Full-screen or expanded camera preview dialog."""
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("MosquitoSentinel - Live Camera Feed (Expanded)")
+            self.setMinimumSize(800, 450)
+            self.resize(1280, 720)
+            self.setStyleSheet("background-color: #0E1B20;")
+
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(14, 12, 14, 14)
+            layout.setSpacing(10)
+
+            top_bar = QHBoxLayout()
+            lbl_title = QLabel("Live Chamber Camera · Press ESC or click Close to return")
+            lbl_title.setStyleSheet("color: #B8CDD2; font-size: 13px; font-weight: 600;")
+            top_bar.addWidget(lbl_title)
+            top_bar.addStretch()
+
+            btn_close = QPushButton("✕ Exit Expanded View")
+            btn_close.setProperty("class", "ghost")
+            btn_close.setCursor(Qt.PointingHandCursor)
+            btn_close.clicked.connect(self.accept)
+            top_bar.addWidget(btn_close)
+            layout.addLayout(top_bar)
+
+            self.viewport = VideoViewport(self)
+            layout.addWidget(self.viewport, stretch=1)
+
+        def set_frame(self, pixmap: QPixmap):
+            self.viewport.set_frame(pixmap)
+
+        def set_stale(self, is_stale: bool, note: str = ""):
+            self.viewport.set_stale(is_stale, note)
+
+        def set_error_message(self, title: str, subtitle: str):
+            self.viewport.set_error_message(title, subtitle)
+
+        def keyPressEvent(self, event):
+            if event.key() == Qt.Key_Escape:
+                self.accept()
+            else:
+                super().keyPressEvent(event)
+
+    class LiveDetectionPage(QWidget):
+        """Live camera stream with mosquito tracking overlay, telemetry, and stream metrics."""
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self._frame_times: List[float] = []
+            self._last_frame_size: Optional[Tuple[int, int]] = None
+            self._last_render_ms: float = 0.0
+            self._latest_diag: Dict[str, Any] = {}
+            self._current_stream_fps: float = 0.0
+            self._expanded_dialog: Optional[ExpandedCameraDialog] = None
+
             root = QVBoxLayout(self)
             root.setContentsMargins(12, 8, 8, 8)
             root.setSpacing(18)
-            root.addLayout(page_header("Live Detection", "Chamber camera with real-time mosquito tracking",
-                                       pill("● Stage 6 · Video streaming", "#DDF3E4", "#14602F")))
+
+            self.badge = pill("● Connecting…", "#E8EEF0", MUTED)
+            root.addLayout(page_header("Live Detection", "Chamber camera with real-time mosquito tracking", self.badge))
 
             card = glass()
             v = QVBoxLayout(card)
             v.setContentsMargins(14, 14, 14, 14)
             v.setSpacing(14)
 
-            viewport = QFrame()
-            viewport.setStyleSheet("background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #17313A, stop:1 #25465A); border-radius: 14px;")
-            vp = QVBoxLayout(viewport)
-            vp.setAlignment(Qt.AlignCenter)
-            t = lbl("Video stream not available yet", 20, 700, "#E6F1F3")
-            s = lbl("Live video streaming arrives in Stage 6. Telemetry is already running.", 13, 400, "#B8CDD2")
-            t.setAlignment(Qt.AlignCenter)
-            s.setAlignment(Qt.AlignCenter)
-            vp.addWidget(t)
-            vp.addWidget(s)
-            v.addWidget(viewport, stretch=1)
+            self.viewport = VideoViewport()
+            v.addWidget(self.viewport, stretch=1)
 
             controls = QHBoxLayout()
-            btn_snap = QPushButton("Snapshot")
-            btn_snap.setProperty("class", "ghost")
-            btn_snap.setEnabled(False)
-            controls.addWidget(btn_snap)
+            self.btn_snap = QPushButton("Snapshot")
+            self.btn_snap.setProperty("class", "ghost")
+            self.btn_snap.setCursor(Qt.PointingHandCursor)
+            self.btn_snap.setEnabled(False)  # enabled once a valid frame is received
+            self.btn_snap.clicked.connect(self._on_snapshot_clicked)
+            controls.addWidget(self.btn_snap)
             controls.addStretch()
-            controls.addWidget(lbl("Resolution — · Frame rate —", 12, 400, SUB))
+
+            self.lbl_stream_info = lbl("Resolution — · Frame rate —", 12, 400, SUB)
+            controls.addWidget(self.lbl_stream_info)
 
             # Symbol-only fullscreen button on the right side
-            btn_full = QPushButton()
-            btn_full.setProperty("class", "ghost")
-            btn_full.setFixedSize(40, 40)
-            btn_full.setToolTip("Fullscreen")
-            btn_full.setAccessibleName("Fullscreen")
-            btn_full.setIcon(svg_icon('<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>', 20))
-            btn_full.setIconSize(QSize(20, 20))
-            btn_full.setEnabled(False)  # enable when Stage 6 streaming is added
-            controls.addWidget(btn_full)
+            self.btn_full = QPushButton()
+            self.btn_full.setProperty("class", "ghost")
+            self.btn_full.setFixedSize(40, 40)
+            self.btn_full.setToolTip("Expand Camera")
+            self.btn_full.setAccessibleName("Expand Camera")
+            self.btn_full.setCursor(Qt.PointingHandCursor)
+            self.btn_full.setIcon(svg_icon('<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>', 20))
+            self.btn_full.setIconSize(QSize(20, 20))
+            self.btn_full.setEnabled(False)
+            self.btn_full.clicked.connect(self._on_expand_camera_clicked)
+            controls.addWidget(self.btn_full)
             v.addLayout(controls)
             root.addWidget(card, stretch=1)
 
+        def _on_snapshot_clicked(self):
+            """Captures the current annotated camera frame and saves it with a unique timestamp."""
+            if not self.viewport.has_frame() or self.viewport._pixmap is None:
+                return
+
+            try:
+                import config
+                captures_dir = getattr(config, "CAPTURES_DIR", "")
+            except Exception:
+                captures_dir = ""
+            if not captures_dir:
+                captures_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captures")
+
+            try:
+                os.makedirs(captures_dir, exist_ok=True)
+                now_dt = datetime.now()
+                fname = f"snapshot_{now_dt.strftime('%Y%m%d_%H%M%S_%f')[:21]}.jpg"
+                fpath = os.path.join(captures_dir, fname)
+                saved = self.viewport._pixmap.save(fpath, "JPG")
+                if saved and os.path.isfile(fpath) and os.path.getsize(fpath) > 0:
+                    orig_text = "Snapshot"
+                    self.btn_snap.setText("✓ Saved!")
+                    QTimer.singleShot(2500, lambda: self.btn_snap.setText(orig_text))
+                    print(f"[INFO] Camera snapshot saved: {fname}")
+                else:
+                    self.btn_snap.setText("⚠ Save failed")
+                    QTimer.singleShot(2500, lambda: self.btn_snap.setText("Snapshot"))
+            except Exception as e:
+                print(f"[ERROR] Snapshot failed: {e}")
+                self.btn_snap.setText("⚠ Error")
+                QTimer.singleShot(2500, lambda: self.btn_snap.setText("Snapshot"))
+
+        def _on_expand_camera_clicked(self):
+            """Expands the camera preview into a dedicated larger view."""
+            self._expanded_dialog = ExpandedCameraDialog(self)
+            if self.viewport.has_frame() and self.viewport._pixmap:
+                self._expanded_dialog.set_frame(self.viewport._pixmap)
+            self._expanded_dialog.show()
+
+        def update_badge(self, state: str):
+            """Updates the top-right badge to Connecting / Live / Stale / Error."""
+            styles = {
+                "connecting": ("● Connecting…", "#E8EEF0", MUTED),
+                "live": ("● Live", "#DDF3E4", OK),
+                "stale": ("● Stale", "#FBEFD5", WARN),
+                "error": ("● Error", "#FDE3E0", BAD),
+            }
+            text, bg, fg = styles.get(state.lower(), ("● " + state.title(), "#E8EEF0", MUTED))
+            self.badge.setText(text)
+            self.badge.setStyleSheet(f"background:{bg}; color:{fg}; border-radius:12px; padding:5px 12px; font-size:12px; font-weight:600;")
+
+        @Slot(QImage, float)
+        def on_frame_received(self, image: QImage, *args, **kwargs):
+            t_ren_start = time.perf_counter()
+            now = time.time()
+            self._frame_times.append(now)
+            cutoff = now - 5.0
+            while len(self._frame_times) > 1 and self._frame_times[0] < cutoff:
+                self._frame_times.pop(0)
+
+            pixmap = QPixmap.fromImage(image)
+            self._last_frame_size = (pixmap.width(), pixmap.height())
+            self.viewport.set_frame(pixmap)
+            self.update_badge("live")
+            self.btn_snap.setEnabled(True)
+            self.btn_full.setEnabled(True)
+
+            if getattr(self, "_expanded_dialog", None) is not None and self._expanded_dialog.isVisible():
+                self._expanded_dialog.set_frame(pixmap)
+
+            w, h = self._last_frame_size
+            self._last_render_ms = (time.perf_counter() - t_ren_start) * 1000.0
+
+            if len(self._frame_times) >= 2:
+                dt = self._frame_times[-1] - self._frame_times[0]
+                fps = (len(self._frame_times) - 1) / dt if dt > 0 else 0.0
+                self._current_stream_fps = fps
+                self._update_stream_info_label(w, h, fps)
+            else:
+                self.lbl_stream_info.setText(f"Resolution {w} × {h} · Stream rate —")
+
+        @Slot(dict)
+        def on_diagnostics_updated(self, diag: Dict[str, Any]):
+            self._latest_diag = diag
+            if len(self._frame_times) >= 2 and self._last_frame_size:
+                w, h = self._last_frame_size
+                self._update_stream_info_label(w, h, self._current_stream_fps)
+
+        def _update_stream_info_label(self, w: int, h: int, fps: float):
+            diag = getattr(self, "_latest_diag", {})
+            dl_ms = diag.get("download_ms")
+            dec_ms = diag.get("decode_ms")
+            ren_ms = getattr(self, "_last_render_ms", 0.0)
+            age_ms = diag.get("frame_age_ms")
+            det_fps = diag.get("detector_fps")
+
+            if dl_ms is not None:
+                latency_parts = [f"dl {dl_ms:.0f}ms", f"dec {dec_ms or 0:.0f}ms"]
+                if ren_ms > 0:
+                    latency_parts.append(f"ren {ren_ms:.0f}ms")
+                tot_lat = (dl_ms or 0) + (dec_ms or 0) + (ren_ms or 0)
+                lat_str = f" · Latency {tot_lat:.0f}ms ({', '.join(latency_parts)})"
+            else:
+                tot_lat = ren_ms
+                lat_str = " (network fetch)"
+            age_str = f" · Age {age_ms/1000.0:.2f}s" if age_ms is not None else ""
+            det_str = f" [Pi {det_fps:.1f} fps]" if det_fps else ""
+
+            self.lbl_stream_info.setText(
+                f"Resolution {w} × {h} · Stream rate {fps:.1f} fps{det_str}{lat_str}{age_str}"
+            )
+
+            drop_count = diag.get("dropped_stale", 0)
+            intv_ms = diag.get("interval_ms", 0)
+            tt = (
+                f"Video Stream Diagnostics:\n"
+                f"  • Preview Resolution: {w} × {h}\n"
+                f"  • Laptop Stream FPS: {fps:.1f} fps (Arrival Interval: {intv_ms:.1f} ms)\n"
+                f"  • Raspberry Pi Detector FPS: {det_fps if det_fps else 'N/A'}\n"
+                f"  • JPEG Download Time: {dl_ms or 0:.1f} ms\n"
+                f"  • Worker Decode Time: {dec_ms or 0:.1f} ms\n"
+                f"  • GUI Render Time: {ren_ms:.1f} ms\n"
+                f"  • Total Preview Latency: {tot_lat:.1f} ms\n"
+                f"  • Frame Age (Sensor -> Screen): {age_ms/1000.0 if age_ms is not None else 'N/A'} s\n"
+                f"  • Stale / Duplicate Frames Discarded: {drop_count}"
+            )
+            self.lbl_stream_info.setToolTip(tt)
+
+        @Slot(str, str)
+        def on_frame_error(self, err_type: str, description: str):
+            error_messages = {
+                "unauthorized": ("Unauthorized (401)", "Invalid or missing token. Check SENTINEL_AUTH_TOKEN or client_config.json."),
+                "not_found": ("Endpoint Not Found (404)", "The camera endpoint /api/frame.jpg was not found on the server."),
+                "no_frame": ("Waiting for first frame (503)", "The camera engine has not produced a frame yet. Live view will appear automatically."),
+                "timeout": ("Connection Timed Out", "No response from Raspberry Pi within 3 seconds."),
+                "connection_refused": ("Cannot Connect to Raspberry Pi", "Connection was refused. Ensure the detector server is running on the Pi."),
+                "decode_error": ("Picture Decode Error", "Received image data could not be decoded as a valid JPEG."),
+                "network_error": ("Network Error", description),
+            }
+            title, subtitle = error_messages.get(err_type, ("Connection Error", description))
+
+            short_reasons = {
+                "unauthorized": "Unauthorized (401)",
+                "not_found": "Not Found (404)",
+                "no_frame": "Waiting for frame (503)",
+                "timeout": "Timed out",
+                "connection_refused": "Connection refused",
+                "decode_error": "Decode error",
+                "network_error": "Network error",
+            }
+            short = short_reasons.get(err_type, "Connection error")
+
+            if self.viewport.has_frame():
+                self.viewport.set_stale(True, short)
+                self.update_badge("stale")
+                w, h = self._last_frame_size if self._last_frame_size else (0, 0)
+                res_str = f"{w} × {h} (stale)" if w and h else "—"
+                self.lbl_stream_info.setText(f"Resolution {res_str} · Stream rate 0.0 fps (stale)")
+                if getattr(self, "_expanded_dialog", None) is not None and self._expanded_dialog.isVisible():
+                    self._expanded_dialog.set_stale(True, short)
+            else:
+                self.btn_snap.setEnabled(False)
+                self.viewport.set_error_message(title, subtitle)
+                if err_type == "no_frame":
+                    self.update_badge("connecting")
+                else:
+                    self.update_badge("error")
+                self.lbl_stream_info.setText("Resolution — · Stream rate —")
+                if getattr(self, "_expanded_dialog", None) is not None and self._expanded_dialog.isVisible():
+                    self._expanded_dialog.set_error_message(title, subtitle)
+
     class HistoryPage(QWidget):
-        """Placeholder for the SQLite registry explorer (will query /api/registry)."""
+        """SQLite registry explorer and CSV exporter querying /api/registry or local database."""
 
         def __init__(self, parent=None):
             super().__init__(parent)
+            self.records: List[Dict[str, Any]] = []
+            self.client_config: Optional[Dict[str, Any]] = None
+            self._filter_all = False
+
             root = QVBoxLayout(self)
             root.setContentsMargins(12, 8, 8, 8)
             root.setSpacing(18)
@@ -1017,15 +1484,35 @@ if PYSIDE6_AVAILABLE:
             bar = glass()
             h = QHBoxLayout(bar)
             h.setContentsMargins(18, 12, 18, 12)
+
+            lbl_date = QLabel("Filter by date:")
+            lbl_date.setStyleSheet(f"color:{SUB}; font-size:12px; font-weight:600;")
+            h.addWidget(lbl_date)
+
             self.date_filter = QDateEdit(QDate.currentDate())
             self.date_filter.setCalendarPopup(True)
             self.date_filter.setDisplayFormat("dd MMM yyyy")
-            self.date_filter.setFixedWidth(170)
+            self.date_filter.setFixedWidth(150)
+            self.date_filter.dateChanged.connect(self._apply_filter)
+            h.addWidget(self.date_filter)
+
+            self.btn_show_all = QPushButton("Show All Dates")
+            self.btn_show_all.setProperty("class", "ghost")
+            self.btn_show_all.setCursor(Qt.PointingHandCursor)
+            self.btn_show_all.clicked.connect(self._show_all_dates)
+            h.addWidget(self.btn_show_all)
+
+            self.lbl_record_count = QLabel("0 records")
+            self.lbl_record_count.setStyleSheet(f"color:{SUB}; font-size:12px;")
+            h.addWidget(self.lbl_record_count)
+
+            h.addStretch()
+
             self.btn_export = QPushButton("Export CSV")
             self.btn_export.setProperty("class", "ghost")
-            self.btn_export.setEnabled(False)  # enable once /api/registry exists
-            h.addWidget(self.date_filter)
-            h.addStretch()
+            self.btn_export.setCursor(Qt.PointingHandCursor)
+            self.btn_export.setEnabled(False)
+            self.btn_export.clicked.connect(self._on_export_csv_clicked)
             h.addWidget(self.btn_export)
             root.addWidget(bar)
 
@@ -1034,9 +1521,170 @@ if PYSIDE6_AVAILABLE:
             v.setContentsMargins(24, 20, 24, 18)
             self.registry = TableWithEmpty(["Timestamp", "ID", "Species", "Confidence", "Hits"],
                                            "No detections to show",
-                                           "Registry records will list here once the history service is connected.")
+                                           "No mosquito detections found in the chamber registry.")
             v.addWidget(self.registry)
             root.addWidget(panel, stretch=1)
+
+        def set_client_config(self, cfg: Dict[str, Any]):
+            self.client_config = cfg
+
+        def _show_all_dates(self):
+            self._filter_all = True
+            self._render_rows()
+
+        def _apply_filter(self):
+            self._filter_all = False
+            self._render_rows()
+
+        def load_records(self, records: List[Dict[str, Any]]):
+            """Loads raw registry records and renders rows under the active date filter."""
+            self.records = records if isinstance(records, list) else []
+            self.btn_export.setEnabled(len(self.records) > 0)
+            self._render_rows()
+
+        def _get_filtered_records(self) -> List[Dict[str, Any]]:
+            if self._filter_all:
+                return self.records
+
+            qdate = self.date_filter.date()
+            filter_str = f"{qdate.year():04d}-{qdate.month():02d}-{qdate.day():02d}"
+            matching = []
+            for r in self.records:
+                ts = str(r.get("last_seen") or r.get("first_seen") or "")
+                if ts.startswith(filter_str):
+                    matching.append(r)
+            return matching
+
+        def _render_rows(self):
+            filtered = self._get_filtered_records()
+            rows = []
+            for r in filtered:
+                ts = str(r.get("last_seen") or r.get("first_seen") or "N/A")
+                mid = str(r.get("mos_id", "N/A"))
+                sp = str(r.get("species", "N/A"))
+                c_val = r.get("confidence")
+                conf = f"{float(c_val)*100:.1f}%" if _is_num(c_val) else "N/A"
+                hits = str(r.get("detect_count", 1))
+                rows.append([ts, mid, sp, conf, hits])
+
+            if filtered:
+                self.lbl_record_count.setText(f"{len(filtered)} records displayed")
+                self.registry.set_rows(rows)
+            else:
+                if self.records:
+                    qdate = self.date_filter.date()
+                    d_str = f"{qdate.year():04d}-{qdate.month():02d}-{qdate.day():02d}"
+                    self.lbl_record_count.setText(f"0 records on {d_str} ({len(self.records)} total)")
+                    self.registry.set_empty_text(
+                        f"No detections on {d_str}",
+                        f"There are {len(self.records)} records on other dates. Click 'Show All Dates' to view all records."
+                    )
+                else:
+                    self.lbl_record_count.setText("0 records")
+                    self.registry.set_empty_text(
+                        "No detections to show",
+                        "No mosquito detections found in the chamber registry."
+                    )
+                self.registry.set_rows([])
+
+        def fetch_registry(self, client_cfg: Optional[Dict[str, Any]] = None):
+            """Fetches records from remote /api/registry, or falls back to local SQLite database."""
+            cfg = client_cfg or self.client_config
+            if cfg is None:
+                cfg = load_client_config()
+
+            records = None
+
+            # 1. Try remote status server /api/registry
+            pi_host = cfg.get("pi_host", "127.0.0.1")
+            pi_port = cfg.get("pi_port", 8080)
+            token = cfg.get("token", "")
+            timeout = cfg.get("timeout_sec", 3.0)
+
+            try:
+                url = f"http://{pi_host}:{pi_port}/api/registry?limit=1000"
+                req = urllib.request.Request(url)
+                if token:
+                    req.add_header("X-Sentinel-Token", token)
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        records = data.get("records", [])
+            except Exception:
+                records = None
+
+            # 2. If remote unreachable, fallback to local SQLite if it exists
+            if records is None:
+                try:
+                    import sqlite3
+                    import config
+                    db_path = getattr(config, "TRACKER_DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "mosquito_registry.db"))
+                    if os.path.isfile(db_path):
+                        uri = f"file:{os.path.abspath(db_path)}?mode=ro"
+                        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+                        conn.row_factory = sqlite3.Row
+                        cur = conn.cursor()
+                        cur.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='mosquito_registry'")
+                        if cur.fetchone()[0] > 0:
+                            cur.execute(
+                                "SELECT id, mos_id, species, first_seen, last_seen, detect_count, "
+                                "confidence, snapshot_path, verification_status "
+                                "FROM mosquito_registry ORDER BY id DESC LIMIT 1000"
+                            )
+                            rows = cur.fetchall()
+                            records = [dict(r) for r in rows]
+                        conn.close()
+                except Exception as e:
+                    print(f"[WARNING] Local registry fallback error: {e}")
+
+            if records is not None:
+                self.load_records(records)
+
+        def _on_export_csv_clicked(self):
+            """Exports detection history records to user-selected CSV file."""
+            records_to_export = self._get_filtered_records()
+            if not records_to_export:
+                records_to_export = self.records
+            if not records_to_export:
+                QMessageBox.information(self, "Export CSV", "No detection records available to export.")
+                return
+
+            now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            default_path = os.path.join(os.path.expanduser("~"), f"mosquito_detection_history_{now_str}.csv")
+            chosen_path, _ = QFileDialog.getSaveFileName(
+                self, "Export Detection History", default_path, "CSV Files (*.csv);;All Files (*)"
+            )
+            if not chosen_path:
+                return
+
+            try:
+                import csv
+                with open(chosen_path, mode="w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        "Timestamp", "Mosquito_ID", "Species", "Confidence", "Hits",
+                        "First_Seen", "Last_Seen", "Verification_Status", "Snapshot_File"
+                    ])
+                    for r in records_to_export:
+                        conf_val = r.get("confidence")
+                        conf_str = f"{float(conf_val)*100:.2f}%" if _is_num(conf_val) else str(conf_val or "")
+                        writer.writerow([
+                            r.get("last_seen") or r.get("first_seen") or "",
+                            r.get("mos_id", ""),
+                            r.get("species", ""),
+                            conf_str,
+                            r.get("detect_count", 1),
+                            r.get("first_seen", ""),
+                            r.get("last_seen", ""),
+                            r.get("verification_status", "unverified"),
+                            r.get("snapshot_path", "")
+                        ])
+                QMessageBox.information(
+                    self, "Export Successful",
+                    f"Successfully exported {len(records_to_export)} records to:\n{chosen_path}"
+                )
+            except Exception as e:
+                QMessageBox.critical(self, "Export Failed", f"Could not export CSV file:\n{e}")
 
     def nice_ceiling(v: float) -> float:
         if v <= 0:
@@ -1867,8 +2515,6 @@ if PYSIDE6_AVAILABLE:
                 self.stack.addWidget(page)
             root.addWidget(self.stack, stretch=1)
 
-            self.switch_page(0)
-
             # Background poller
             self.polling_worker = StatusPollingWorker(self.client_config)
             self.polling_worker.sig_status_updated.connect(self.on_status_updated)
@@ -1876,6 +2522,15 @@ if PYSIDE6_AVAILABLE:
             self.overview_page.retry_requested.connect(self.polling_worker.poll_now)
             self.analytics_page.refresh_requested.connect(self.polling_worker.poll_now)
             self.polling_worker.start()
+
+            # Live camera frame worker (active only on Live Detection page)
+            self.frame_worker = FrameFetchWorker(self.client_config)
+            self.frame_worker.sig_frame_received.connect(self.live_page.on_frame_received)
+            self.frame_worker.sig_diagnostics_updated.connect(self.live_page.on_diagnostics_updated)
+            self.frame_worker.sig_frame_error.connect(self.live_page.on_frame_error)
+            self.frame_worker.start()
+
+            self.switch_page(0)
 
         def _build_sidebar(self) -> QFrame:
             sidebar = glass(36)
@@ -1937,6 +2592,13 @@ if PYSIDE6_AVAILABLE:
             self.stack.setCurrentIndex(index)
             for idx, btn in enumerate(self.nav_buttons):
                 btn.setChecked(idx == index)
+            if getattr(self, "frame_worker", None) is not None:
+                if index == 1:
+                    self.frame_worker.resume()
+                else:
+                    self.frame_worker.pause()
+            if index == 2 and getattr(self, "history_page", None) is not None:
+                self.history_page.fetch_registry(self.client_config)
 
         @Slot(dict)
         def on_status_updated(self, data: Dict[str, Any]):
@@ -1944,6 +2606,8 @@ if PYSIDE6_AVAILABLE:
             self.alerts_page.update_cusum(data.get("cusum"))
             self.analytics_page.record_status(data)
             self.analytics_page.set_connection("connected")
+            if self.stack.currentIndex() == 2 and getattr(self, "history_page", None) is not None:
+                self.history_page.fetch_registry(self.client_config)
             self._set_conn("Connected", OK)
 
         @Slot(str, str)
@@ -1961,10 +2625,13 @@ if PYSIDE6_AVAILABLE:
                 self._set_conn("Connection error", BAD)
 
         def closeEvent(self, event):
-            """Stop the polling thread cleanly."""
+            """Stop background worker threads cleanly."""
             if getattr(self, "polling_worker", None) is not None:
                 self.polling_worker.stop()
                 self.polling_worker.wait(3000)
+            if getattr(self, "frame_worker", None) is not None:
+                self.frame_worker.stop()
+                self.frame_worker.wait(3000)
             event.accept()
 
 
