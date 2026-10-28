@@ -411,7 +411,7 @@ class ChamberDetector:
         # CUSUM Activity Monitor & 30-min Interval Accumulator
         self.cusum_monitor = None
         self.cusum_accumulator = None
-        if getattr(config, 'CUSUM_ENABLED', True) and CusumMonitor is not None:
+        if getattr(config, 'CUSUM_ENABLED', False) and CusumMonitor is not None:
             cusum_db = getattr(config, 'CUSUM_DB_PATH', None)
             self.cusum_monitor = CusumMonitor(db_path=cusum_db, config=CusumConfig())
             self.cusum_accumulator = CusumIntervalAccumulator(

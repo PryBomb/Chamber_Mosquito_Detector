@@ -145,7 +145,8 @@ def _centroid_distance(b1, b2):
 class ActiveMosquitoTrack:
     """Represents a live mosquito currently being tracked inside the chamber."""
     def __init__(self, track_id: int, mos_id: str, species: str, confidence: float,
-                 box: Tuple[int, int, int, int], crop_bgr: Optional[np.ndarray], now_str: str):
+                 box: Tuple[int, int, int, int], crop_bgr: Optional[np.ndarray], now_str: str,
+                 hit_count: int = 1):
         self.track_id = track_id
         self.mos_id = mos_id
         self.species = species
@@ -158,7 +159,7 @@ class ActiveMosquitoTrack:
         self.last_db_update = self.last_seen_time
         self.last_logged_time = self.last_seen_time
         self.missed_frames = 0
-        self.hit_count = 1
+        self.hit_count = int(hit_count)
         self.pending_db_hits = 0
 
     @property
@@ -283,6 +284,12 @@ class MosquitoTracker:
         self._pending_tracks = []
         self._next_track_id = 1
         self.last_snapshot_time = 0.0
+
+        # Confirmed Aedes aegypti threshold alert state
+        self._last_alert_status = "NORMAL"
+        self._last_alert_time = None
+        self._alert_history = []
+
         print(f"[MosquitoTracker] SQLite registry ready -- {len(self._cache)} known mosquito(es).")
 
     def _init_db(self):
@@ -634,6 +641,7 @@ class MosquitoTracker:
             used_dets = set()
             new_pending = []
             confirmed_dets = set()
+            confirmed_hits = {}
             for score, p_i, d_idx in pend_candidates:
                 if p_i in used_pend or d_idx in used_dets:
                     continue
@@ -642,6 +650,7 @@ class MosquitoTracker:
                 hits = self._pending_tracks[p_i]["hits"] + 1
                 if hits >= pending_needed:
                     confirmed_dets.add(d_idx)
+                    confirmed_hits[d_idx] = hits
                 else:
                     new_pending.append({"box": sanitized_dets[d_idx]["box"], "hits": hits})
             for d_idx in unmatched_idx:
@@ -710,7 +719,8 @@ class MosquitoTracker:
                 # Add to active tracks
                 tid = self._next_track_id
                 self._next_track_id += 1
-                new_track = ActiveMosquitoTrack(tid, mos_id, species, conf, box, crop, now_str)
+                promoted_hits = confirmed_hits.get(d_idx, pending_needed)
+                new_track = ActiveMosquitoTrack(tid, mos_id, species, conf, box, crop, now_str, hit_count=promoted_hits)
                 new_track.last_logged_time = now_time
                 self._active_tracks[tid] = new_track
                 active_mos_ids.add(mos_id)
@@ -892,11 +902,79 @@ class MosquitoTracker:
                 }
                 for t in self._active_tracks.values()
             ]
+            # -------------------------------------------------------------
+            # Confirmed Aedes aegypti Threshold Alert Evaluation
+            # -------------------------------------------------------------
+            target_species = getattr(config, "ALERT_TARGET_SPECIES", "Aedes aegypti")
+            threshold = getattr(config, "ALERT_THRESHOLD_COUNT", 3)
+            min_conf = getattr(config, "ALERT_MIN_CONFIDENCE", 0.80)
+            min_hits = getattr(config, "ALERT_CONFIRM_FRAMES", 3)
+
+            seen_ids = set()
+            qualifying_tracks = []
+            for t in self._active_tracks.values():
+                t_id = getattr(t, "mos_id", None)
+                if not t_id or t_id in seen_ids:
+                    continue
+                t_sp = getattr(t, "species", "").strip()
+                t_conf = float(getattr(t, "confidence", 0.0))
+                t_hits = int(getattr(t, "hit_count", 0))
+                if t_sp == target_species and t_conf >= min_conf and t_hits >= min_hits:
+                    seen_ids.add(t_id)
+                    qualifying_tracks.append({
+                        "mos_id": t.mos_id,
+                        "species": t.species,
+                        "confidence": round(t.confidence, 4),
+                        "hit_count": t.hit_count,
+                        "first_seen": getattr(t, "first_seen", ""),
+                        "last_seen": getattr(t, "last_seen", ""),
+                    })
+
+            qualifying_count = len(qualifying_tracks)
+            is_triggered = bool(qualifying_count >= threshold)
+            new_status = "ALERT TRIGGERED" if is_triggered else "NORMAL"
+
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # Record history entry only when alert status changes (avoiding polling duplicates)
+            if new_status != self._last_alert_status:
+                reason = (
+                    f"{qualifying_count} confirmed {target_species} mosquitoes detected (threshold: {threshold})"
+                    if is_triggered else
+                    f"Qualifying {target_species} count fell to {qualifying_count} (< {threshold})"
+                )
+                self._alert_history.append({
+                    "timestamp": now_str,
+                    "status": new_status,
+                    "qualifying_count": qualifying_count,
+                    "qualifying_ids": [q["mos_id"] for q in qualifying_tracks],
+                    "threshold": threshold,
+                    "reason": reason,
+                })
+                self._last_alert_status = new_status
+                if is_triggered:
+                    self._last_alert_time = now_str
+
+            alert_payload = {
+                "status": self._last_alert_status,
+                "alert_triggered": bool(self._last_alert_status == "ALERT TRIGGERED"),
+                "target_species": target_species,
+                "threshold": threshold,
+                "min_confidence": min_conf,
+                "min_confirm_frames": min_hits,
+                "qualifying_count": qualifying_count,
+                "qualifying_ids": [q["mos_id"] for q in qualifying_tracks],
+                "qualifying_tracks": qualifying_tracks,
+                "last_alert_time": self._last_alert_time,
+                "alert_history": list(reversed(self._alert_history[-20:])),
+            }
+
             return {
                 "active_ids": active_ids,
                 "active_tracks": active_summary,
                 "active_count": len(active_ids),
                 "pending_count": len(self._pending_tracks),
+                "alert": alert_payload,
             }
 
     def flush(self):
@@ -910,4 +988,5 @@ class MosquitoTracker:
 
     def close(self):
         self.flush()
-        self._sync.stop()
+        if self._sync is not None:
+            self._sync.stop()

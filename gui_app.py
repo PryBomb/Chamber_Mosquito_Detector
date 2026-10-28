@@ -2270,7 +2270,7 @@ if PYSIDE6_AVAILABLE:
             self.cusum_pill.setStyleSheet(f"background:{bg}; color:{fg}; border-radius:12px; padding:4px 12px; font-size:12px; font-weight:600;")
 
     class CusumAlertsPage(QWidget):
-        """CUSUM activity monitoring: state cards, decision parameters, alert history."""
+        """Confirmed Aedes aegypti alert monitoring & historical CUSUM telemetry."""
 
         def __init__(self, parent=None):
             super().__init__(parent)
@@ -2281,15 +2281,15 @@ if PYSIDE6_AVAILABLE:
             root.setContentsMargins(12, 8, 8, 8)
             root.setSpacing(18)
             root.addLayout(page_header("Activity Alerts",
-                                       "CUSUM monitoring detects sustained rises in chamber activity (30-min intervals)"))
+                                       "Confirmed Aedes aegypti threshold monitoring (3+ mosquitoes, >= 80% confidence)"))
 
             grid = QGridLayout()
             grid.setHorizontalSpacing(16)
-            self.card_state = MetricCard("Surveillance state", "INSUFFICIENT DATA", "Awaiting CUSUM telemetry…")
-            self.card_s_plus = MetricCard("CUSUM score (S+)", "S+ = N/A", "Threshold: h = 5.0 | Slack: k = 0.5")
-            self.card_activity = MetricCard("Activity, last 30 min", "N/A", "Unique confirmed IDs in interval")
-            self.card_baseline = MetricCard("Daily baseline", "N/A", "Mean: N/A | Std: N/A")
-            for i, c in enumerate((self.card_state, self.card_s_plus, self.card_activity, self.card_baseline)):
+            self.card_state = MetricCard("Surveillance state", "NORMAL", "Awaiting telemetry…")
+            self.card_count = MetricCard("Active Aedes aegypti", "0 qualifying", "Threshold: >= 3 mosquitoes")
+            self.card_threshold = MetricCard("Alert threshold", ">= 3 mosquitoes", "Target: Aedes aegypti")
+            self.card_rules = MetricCard("Qualification rules", "Conf >= 80% · Hits >= 3", "Unique active tracking IDs only")
+            for i, c in enumerate((self.card_state, self.card_count, self.card_threshold, self.card_rules)):
                 grid.addWidget(c, 0, i)
                 grid.setColumnStretch(i, 1)
             root.addLayout(grid)
@@ -2297,148 +2297,103 @@ if PYSIDE6_AVAILABLE:
             lower = QHBoxLayout()
             lower.setSpacing(16)
 
-            diag = glass()
-            dv = QVBoxLayout(diag)
-            dv.setContentsMargins(24, 22, 24, 18)
-            dv.addWidget(lbl("Detection settings", 16, 700))
-            self.diag_labels = add_info_rows(dv, [
-                ("baseline_status", "Baseline status", "N/A"),
-                ("window_type", "Current diurnal window", "N/A"),
-                ("threshold_h", "Alert threshold (h)", "5.00"),
-                ("reference_k", "Allowance (k)", "0.50"),
-                ("min_std", "Minimum std. floor, max(σ, 0.5)", "0.50"),
-                ("last_alert_time", "Latest alert", "None"),
-                ("last_alert_reason", "Alert description", "No active alerts"),
-            ])
-            for k in ("threshold_h", "reference_k", "min_std"):
-                set_value(self.diag_labels[k], self.diag_labels[k].text(), INK)
-            dv.addStretch()
-            lower.addWidget(diag, stretch=1)
+            # Left panel: Live Qualifying Mosquitoes
+            active_panel = glass()
+            av = QVBoxLayout(active_panel)
+            av.setContentsMargins(24, 22, 24, 18)
+            av.addWidget(lbl("Qualifying Mosquitoes in Chamber", 16, 700))
+            self.active_table = TableWithEmpty(["MOS ID", "Species", "Confidence", "Confirmation Hits"],
+                                               "No qualifying mosquitoes",
+                                               "Active Aedes aegypti meeting >= 80% confidence and 3 confirmation frames will appear here.")
+            av.addWidget(self.active_table, stretch=1)
+            lower.addWidget(active_panel, stretch=1)
 
-            hist = glass()
-            hv = QVBoxLayout(hist)
+            # Right panel: Alert History
+            hist_panel = glass()
+            hv = QVBoxLayout(hist_panel)
             hv.setContentsMargins(24, 22, 24, 18)
-            hv.addWidget(lbl("Alert history", 16, 700))
-            self.alerts = TableWithEmpty(["Time", "Window", "Activity", "S+"],
-                                         "No active alerts",
-                                         "Alerts will be logged here when activity rises above baseline.")
-            hv.addWidget(self.alerts, stretch=1)
-            lower.addWidget(hist, stretch=1)
+            hv.addWidget(lbl("Alert History", 16, 700))
+            self.history_table = TableWithEmpty(["Timestamp", "Status", "Count", "Reason"],
+                                                "No alert events recorded",
+                                                "Status transitions between NORMAL and ALERT TRIGGERED will be recorded here.")
+            hv.addWidget(self.history_table, stretch=1)
+            lower.addWidget(hist_panel, stretch=1)
             root.addLayout(lower, stretch=1)
 
-        def update_cusum(self, cusum_data: Optional[Dict[str, Any]]):
-            """Update from the 'cusum' block of the status payload."""
-            if not cusum_data or not isinstance(cusum_data, dict):
-                self.card_state.update_value("INSUFFICIENT DATA", "Awaiting CUSUM telemetry…")
-                self.card_state.set_accent_color(MUTED)
-                self.card_s_plus.update_value("S+ = N/A", "Threshold: h = 5.0 | Slack: k = 0.5")
-                self.card_s_plus.set_accent_color(MUTED)
-                self.card_activity.update_value("N/A", "Unique confirmed IDs in interval")
-                self.card_activity.set_accent_color(MUTED)
-                self.card_baseline.update_value("N/A", "Mean: N/A | Std: N/A")
-                self.card_baseline.set_accent_color(MUTED)
-                for k in ("baseline_status", "window_type", "last_alert_time", "last_alert_reason"):
-                    set_value(self.diag_labels[k], "N/A", MUTED)
+        def update_alert(self, alert_data: Optional[Dict[str, Any]], cusum_data: Optional[Dict[str, Any]] = None):
+            """Update from the 'alert' block of the status payload, with fallback to cusum."""
+            if alert_data and isinstance(alert_data, dict):
+                status = str(alert_data.get("status", "NORMAL")).upper()
+                count = alert_data.get("qualifying_count", 0)
+                thresh = alert_data.get("threshold", 3)
+                species = alert_data.get("target_species", "Aedes aegypti")
+                min_conf = alert_data.get("min_confidence", 0.80)
+                min_hits = alert_data.get("min_confirm_frames", 3)
+                is_triggered = bool(alert_data.get("alert_triggered", False) or status == "ALERT TRIGGERED")
+
+                if is_triggered:
+                    self.card_state.update_value("ALERT TRIGGERED", f"Active {species} >= {thresh}")
+                    self.card_state.set_accent_color(BAD)
+                else:
+                    self.card_state.update_value("NORMAL", f"Chamber within safe threshold (< {thresh})")
+                    self.card_state.set_accent_color(OK)
+
+                self.card_count.update_value(f"{count} qualifying", f"Active {species} IDs")
+                self.card_count.set_accent_color(BAD if is_triggered else (OK if count > 0 else INK))
+
+                self.card_threshold.update_value(f">= {thresh} mosquitoes", f"Target: {species}")
+                self.card_threshold.set_accent_color(INK)
+
+                self.card_rules.update_value(f"Conf >= {int(min_conf*100)}% · Hits >= {min_hits}", "Unique active tracking IDs only")
+                self.card_rules.set_accent_color(INK)
+
+                # Qualifying tracks table
+                q_rows = []
+                for trk in alert_data.get("qualifying_tracks", []):
+                    if isinstance(trk, dict):
+                        c_val = trk.get("confidence", 0.0)
+                        conf_str = f"{c_val*100:.1f}%" if isinstance(c_val, (int, float)) else str(c_val)
+                        q_rows.append([
+                            str(trk.get("mos_id", "N/A")),
+                            str(trk.get("species", "N/A")),
+                            conf_str,
+                            str(trk.get("hit_count", "N/A"))
+                        ])
+                self.active_table.set_rows(q_rows)
+
+                # Alert history table
+                h_rows = []
+                for h in alert_data.get("alert_history", []):
+                    if isinstance(h, dict):
+                        h_rows.append([
+                            str(h.get("timestamp", "N/A")),
+                            str(h.get("status", "N/A")),
+                            str(h.get("qualifying_count", "N/A")),
+                            str(h.get("reason", "N/A"))
+                        ])
+                self.history_table.set_rows(h_rows)
                 return
 
-            state = str(cusum_data.get("state", "UNKNOWN")).upper()
-            w_type = str(cusum_data.get("window_type", "N/A")).capitalize()
-            activity = cusum_data.get("current_activity")
-            s_plus = cusum_data.get("s_plus")
-            thresh_h = cusum_data.get("threshold_h", 5.0)
-            ref_k = cusum_data.get("reference_k", 0.5)
-            b_mean = cusum_data.get("baseline_mean")
-            b_std = cusum_data.get("baseline_std")
-            b_n = cusum_data.get("baseline_n", 0)
-            b_days = cusum_data.get("baseline_days", 0)
-            b_days_req = cusum_data.get("baseline_days_required", 7)
-            b_ready = bool(cusum_data.get("baseline_ready", False))
-            alert_time = cusum_data.get("last_alert_time")
-            alert_reason = cusum_data.get("last_alert_reason")
+            if cusum_data and isinstance(cusum_data, dict):
+                # Fallback display if historical cusum data is provided
+                state = str(cusum_data.get("state", "UNKNOWN")).upper()
+                self.card_state.update_value(state, "CUSUM historical data")
+                self.card_state.set_accent_color(BAD if state == "ALERT_TRIGGERED" else OK)
+                return
 
-            # State card
-            if state == "ALERT_TRIGGERED":
-                self.card_state.update_value("ALERT TRIGGERED", f"Window: {w_type} (sustained increase)")
-                self.card_state.set_accent_color(BAD)
-            elif state == "MONITORING":
-                self.card_state.update_value("MONITORING", f"Active window: {w_type}")
-                self.card_state.set_accent_color(OK)
-            elif state == "COLLECTING_BASELINE":
-                self.card_state.update_value("COLLECTING", f"Baseline (Day {b_days}/{b_days_req}, N={b_n}/12)")
-                self.card_state.set_accent_color(WARN)
-            elif state == "OFFLINE":
-                self.card_state.update_value("DETECTOR OFFLINE", "Observation collection paused")
-                self.card_state.set_accent_color(BAD)
-            else:
-                self.card_state.update_value("INSUFFICIENT DATA", f"Window: {w_type}")
-                self.card_state.set_accent_color(MUTED)
+            self.card_state.update_value("STANDBY", "Awaiting telemetry…")
+            self.card_state.set_accent_color(MUTED)
 
-            # S+ card
-            if isinstance(s_plus, (int, float)):
-                self.card_s_plus.update_value(f"S+ = {s_plus:.2f}", f"Threshold: h = {thresh_h:.1f} | Slack: k = {ref_k:.1f}")
-                self.card_s_plus.set_accent_color(BAD if s_plus >= thresh_h else TEAL)
-            else:
-                self.card_s_plus.update_value("S+ = N/A", f"Threshold: h = {thresh_h:.1f} | Slack: k = {ref_k:.1f}")
-                self.card_s_plus.set_accent_color(MUTED)
-
-            # Activity card
-            if isinstance(activity, (int, float)):
-                self.card_activity.update_value(f"{int(activity)} IDs", "Unique IDs in 30-min window")
-                self.card_activity.set_accent_color(INK)
-            else:
-                self.card_activity.update_value("N/A", "No valid interval observation")
-                self.card_activity.set_accent_color(MUTED)
-
-            # Baseline card
-            if isinstance(b_mean, (int, float)) and b_std is not None:
-                self.card_baseline.update_value(f"μ₀ {b_mean:.2f} · σ₀ {b_std:.2f}",
-                                                f"N = {b_n} valid intervals ({'Ready' if b_ready else 'Collecting'})")
-                self.card_baseline.set_accent_color(INK)
-            else:
-                self.card_baseline.update_value("N/A", f"Collecting (Day {b_days}/{b_days_req}, N={b_n}/12)")
-                self.card_baseline.set_accent_color(MUTED)
-
-            # Detail rows
-            set_value(self.diag_labels["baseline_status"],
-                      f"Ready (7 days, N = {b_n})" if b_ready else f"Collecting (Day {b_days}/{b_days_req}, N = {b_n}/12)",
-                      OK if b_ready else WARN)
-            set_value(self.diag_labels["window_type"], w_type, INK)
-            set_value(self.diag_labels["threshold_h"], f"{thresh_h:.2f}", INK)
-            set_value(self.diag_labels["reference_k"], f"{ref_k:.2f}", INK)
-            set_value(self.diag_labels["last_alert_time"], alert_time if alert_time else "None", INK if alert_time else MUTED)
-            set_value(self.diag_labels["last_alert_reason"],
-                      alert_reason[:45] if alert_reason else "No active alerts", INK if alert_reason else MUTED)
-
-            # Alert history
-            rows = []
-            history = cusum_data.get("alert_history", [])
-            if isinstance(history, list):
-                for rec in history:
-                    if not isinstance(rec, dict):
-                        continue
-                    act = rec.get("activity_value")
-                    s_val = rec.get("s_plus")
-                    rows.append([
-                        str(rec.get("timestamp", "N/A")),
-                        str(rec.get("window_type", "N/A")).capitalize(),
-                        f"{int(act)} IDs" if isinstance(act, (int, float)) else str(act or "N/A"),
-                        f"{float(s_val):.2f}" if isinstance(s_val, (int, float)) else str(s_val or "N/A"),
-                    ])
-            self.alerts.set_rows(rows)
+        def update_cusum(self, cusum_data: Optional[Dict[str, Any]]):
+            """Backward compatibility adapter for existing callers."""
+            self.update_alert(None, cusum_data)
 
         def set_offline_state(self, err_type: str, description: str):
             """Polling failed or the detector went offline."""
             self.card_state.update_value("OFFLINE", "Telemetry unavailable")
             self.card_state.set_accent_color(BAD)
-            self.card_s_plus.update_value("S+ = N/A", "Detector connection offline")
-            self.card_s_plus.set_accent_color(MUTED)
-            self.card_activity.update_value("N/A", "No observations")
-            self.card_activity.set_accent_color(MUTED)
-            self.card_baseline.update_value("PAUSED", "Waiting for detector")
-            self.card_baseline.set_accent_color(MUTED)
-            set_value(self.diag_labels["baseline_status"], "Offline", BAD)
-            set_value(self.diag_labels["window_type"], "N/A", MUTED)
-            # Keep any existing alert rows so history stays readable while offline.
+            self.card_count.update_value("N/A", "Detector connection offline")
+            self.card_count.set_accent_color(MUTED)
 
     class SettingsPage(QWidget):
         """Read-only view of client_config.json."""
@@ -2620,7 +2575,7 @@ if PYSIDE6_AVAILABLE:
         @Slot(dict)
         def on_status_updated(self, data: Dict[str, Any]):
             self.overview_page.update_telemetry(data)
-            self.alerts_page.update_cusum(data.get("cusum"))
+            self.alerts_page.update_alert(data.get("alert"), data.get("cusum"))
             self.analytics_page.record_status(data)
             self.analytics_page.set_connection("connected")
             if self.stack.currentIndex() == 2 and getattr(self, "history_page", None) is not None:

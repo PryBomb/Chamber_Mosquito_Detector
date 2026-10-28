@@ -347,7 +347,11 @@ class SentinelStatusHandler(BaseHTTPRequestHandler):
             # Compute uptime
             uptime_sec = None
             if getattr(detector, "start_time", None) is not None:
-                uptime_sec = round(time.time() - detector.start_time, 2)
+                st = detector.start_time
+                if isinstance(st, (int, float)):
+                    uptime_sec = round(time.time() - st, 2)
+                elif hasattr(st, "timestamp"):
+                    uptime_sec = round(time.time() - st.timestamp(), 2)
 
             # Age of last frame
             age_of_last_frame = None
@@ -358,11 +362,13 @@ class SentinelStatusHandler(BaseHTTPRequestHandler):
             # Tracker status via thread-safe lock
             active_track_ids = []
             active_tracks_summary = []
+            alert_data = None
             tracker = getattr(detector, "tracker", None)
             if tracker is not None and hasattr(tracker, "get_status"):
                 t_stat = tracker.get_status()
                 active_track_ids = t_stat.get("active_ids", [])
                 active_tracks_summary = t_stat.get("active_tracks", [])
+                alert_data = t_stat.get("alert", None)
 
             # Confirmed detections in the current frame (as of the last AI result)
             confirmed_in_frame = getattr(detector, "confirmed_detections_count", None)
@@ -381,16 +387,18 @@ class SentinelStatusHandler(BaseHTTPRequestHandler):
             else:
                 registry_total = self.server.get_cached_registry_count(db_path)
 
-            # Optional CUSUM statistical monitor status
+            # Optional CUSUM statistical monitor status (only if enabled)
             cusum_data = None
-            cusum_mon = getattr(detector, "cusum_monitor", None)
-            if cusum_mon is not None and hasattr(cusum_mon, "get_status"):
-                try:
-                    cusum_data = cusum_mon.get_status().to_dict()
-                    if hasattr(cusum_mon, "get_alert_history"):
-                        cusum_data["alert_history"] = cusum_mon.get_alert_history(limit=20)
-                except Exception:
-                    cusum_data = None
+            import config
+            if getattr(config, "CUSUM_ENABLED", False):
+                cusum_mon = getattr(detector, "cusum_monitor", None)
+                if cusum_mon is not None and hasattr(cusum_mon, "get_status"):
+                    try:
+                        cusum_data = cusum_mon.get_status().to_dict()
+                        if hasattr(cusum_mon, "get_alert_history"):
+                            cusum_data["alert_history"] = cusum_mon.get_alert_history(limit=20)
+                    except Exception:
+                        cusum_data = None
 
             status_payload = {
                 "detector_running": bool(getattr(detector, "worker_running", False)),
@@ -403,6 +411,7 @@ class SentinelStatusHandler(BaseHTTPRequestHandler):
                 "active_track_ids": active_track_ids,
                 "active_tracks_summary": active_tracks_summary,
                 "registry_total_count": registry_total,
+                "alert": alert_data,
                 "cusum": cusum_data,
                 "system_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }

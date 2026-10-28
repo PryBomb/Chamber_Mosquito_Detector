@@ -107,10 +107,18 @@ SUPABASE_TABLE   = "mosquito_registry"
 SUPABASE_BUCKET  = "mosquito-images"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CUSUM Activity Monitor Configuration (cusum_monitor.py)
+# Confirmed Aedes aegypti Threshold Alert Configuration
 # ─────────────────────────────────────────────────────────────────────────────
-# Note: Provisional engineering parameters; require evaluation against empirical surveillance data.
-CUSUM_ENABLED                 = True
+ALERT_ENABLED                 = True
+ALERT_TARGET_SPECIES          = "Aedes aegypti"
+ALERT_THRESHOLD_COUNT         = 3      # Minimum qualifying unique mosquitoes to trigger alert
+ALERT_MIN_CONFIDENCE          = 0.80   # Minimum 80% confidence requirement
+ALERT_CONFIRM_FRAMES          = 3      # Must satisfy existing tracking confirmation requirement
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CUSUM Activity Monitor Configuration (Decommissioned from active alerts)
+# ─────────────────────────────────────────────────────────────────────────────
+CUSUM_ENABLED                 = False  # Decommissioned from active alerts; historical DB preserved
 CUSUM_DB_PATH                 = os.path.join(BASE_DIR, "cusum_history.db")
 CUSUM_INTERVAL_MINUTES        = 30     # Discrete evaluation interval duration (minutes)
 CUSUM_BASELINE_DAYS           = 7      # Duration of initial baseline collection period (valid days)
