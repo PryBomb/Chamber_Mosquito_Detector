@@ -116,6 +116,13 @@ ALERT_MIN_CONFIDENCE          = 0.80   # Minimum 80% confidence requirement
 ALERT_CONFIRM_FRAMES          = 3      # Must satisfy existing tracking confirmation requirement
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Hardware Alarm Pinout (Raspberry Pi GPIO)
+# ─────────────────────────────────────────────────────────────────────────────
+GPIO_ALARM_ENABLED            = True   # Set to True on Raspberry Pi to toggle hardware pin
+GPIO_ALARM_PIN                = 17     # BCM GPIO17 (Physical Header Pin 11)
+GPIO_ALARM_ACTIVE_HIGH        = True   # True: HIGH (3.3V) when alert triggered, LOW (0V) when normal
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CUSUM Activity Monitor Configuration (Decommissioned from active alerts)
 # ─────────────────────────────────────────────────────────────────────────────
 CUSUM_ENABLED                 = False  # Decommissioned from active alerts; historical DB preserved

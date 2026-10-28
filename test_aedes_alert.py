@@ -358,5 +358,29 @@ class TestGUIAlertsPage(unittest.TestCase):
         self.assertEqual(page.active_table.table.rowCount(), 1)
 
 
+class TestHardwareAlarmController(unittest.TestCase):
+    """Verifies that HardwareAlarmController toggles safely in simulated and real environments."""
+
+    def test_01_hardware_alarm_controller_lifecycle(self):
+        from chamber_detector_server import HardwareAlarmController
+
+        ctrl = HardwareAlarmController(pin=17, active_high=True, enabled=True)
+        self.assertEqual(ctrl.pin, 17)
+        self.assertTrue(ctrl.enabled)
+        self.assertFalse(ctrl._current_state)
+
+        # Trigger alarm
+        ctrl.set_alarm(True)
+        self.assertTrue(ctrl._current_state)
+
+        # Deactivate alarm
+        ctrl.set_alarm(False)
+        self.assertFalse(ctrl._current_state)
+
+        # Cleanup
+        ctrl.cleanup()
+        self.assertFalse(ctrl._current_state)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -237,6 +237,83 @@ class MosquitoClassifier:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 2B. Hardware Alarm Pin Controller (Raspberry Pi GPIO)
+# ─────────────────────────────────────────────────────────────────────────────
+class HardwareAlarmController:
+    """Controls physical alarm hardware (e.g. buzzer, relay, LED) via Raspberry Pi GPIO."""
+    def __init__(self, pin: int = 17, active_high: bool = True, enabled: bool = True):
+        self.pin = pin
+        self.active_high = active_high
+        self.enabled = enabled
+        self.backend = None
+        self._dev = None
+        self._current_state = False
+
+        if not self.enabled:
+            return
+
+        # Attempt 1: gpiozero (recommended on Raspberry Pi OS Bookworm & Bullseye)
+        try:
+            from gpiozero import OutputDevice
+            self._dev = OutputDevice(self.pin, active_high=self.active_high, initial_value=False)
+            self.backend = "gpiozero"
+            print(f"[GPIO] Hardware alarm output initialized on BCM GPIO{self.pin} via gpiozero.")
+            return
+        except Exception:
+            pass
+
+        # Attempt 2: RPi.GPIO
+        try:
+            import RPi.GPIO as GPIO
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setwarnings(False)
+            init_val = GPIO.LOW if self.active_high else GPIO.HIGH
+            GPIO.setup(self.pin, GPIO.OUT, initial=init_val)
+            self.backend = "RPi.GPIO"
+            print(f"[GPIO] Hardware alarm output initialized on BCM GPIO{self.pin} via RPi.GPIO.")
+            return
+        except Exception:
+            pass
+
+        print(f"[GPIO] Running in simulated/non-Pi environment; GPIO{self.pin} alarm output simulated.")
+        self.backend = "simulated"
+
+    def set_alarm(self, is_triggered: bool):
+        if self._current_state == is_triggered:
+            return
+        self._current_state = is_triggered
+        state_str = "ACTIVE (HIGH)" if (is_triggered if self.active_high else not is_triggered) else "NORMAL (LOW)"
+        print(f"[GPIO] Alarm GPIO{self.pin} output set to: {state_str}")
+
+        if not self.enabled or self.backend == "simulated":
+            return
+
+        try:
+            if self.backend == "gpiozero" and self._dev is not None:
+                if is_triggered:
+                    self._dev.on()
+                else:
+                    self._dev.off()
+            elif self.backend == "RPi.GPIO":
+                import RPi.GPIO as GPIO
+                val = GPIO.HIGH if (is_triggered if self.active_high else not is_triggered) else GPIO.LOW
+                GPIO.output(self.pin, val)
+        except Exception as e:
+            print(f"[GPIO] Error updating GPIO{self.pin}: {e}")
+
+    def cleanup(self):
+        try:
+            self.set_alarm(False)
+            if self.backend == "gpiozero" and self._dev is not None:
+                self._dev.close()
+            elif self.backend == "RPi.GPIO":
+                import RPi.GPIO as GPIO
+                GPIO.cleanup(self.pin)
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 3. CUSUM Interval Surveillance Accumulator
 # ─────────────────────────────────────────────────────────────────────────────
 class CusumIntervalAccumulator(threading.Thread):
@@ -421,6 +498,12 @@ class ChamberDetector:
             )
             self.cusum_accumulator.start()
             print("[INFO] CUSUM Activity Monitor & 30-min Accumulator initialized.")
+
+        # Hardware Alarm Output (Raspberry Pi GPIO17)
+        gpio_enabled = getattr(config, "GPIO_ALARM_ENABLED", True)
+        gpio_pin = getattr(config, "GPIO_ALARM_PIN", 17)
+        gpio_active_high = getattr(config, "GPIO_ALARM_ACTIVE_HIGH", True)
+        self.alarm_gpio = HardwareAlarmController(pin=gpio_pin, active_high=gpio_active_high, enabled=gpio_enabled)
 
         # Initialize CSV log if not present
         if not os.path.exists(config.LOG_FILE):
@@ -626,6 +709,13 @@ class ChamberDetector:
             if self.tracker is not None:
                 tracked_results = self.tracker.update_tracks(mosquito_candidates, frame_to_process)
                 mosquito_detections = [(r["box"], r["label"], r["color"]) for r in tracked_results]
+
+                # Update physical hardware alarm GPIO state
+                t_stat = self.tracker.get_status()
+                alert_info = t_stat.get("alert", {})
+                is_alert = bool(alert_info.get("alert_triggered", False))
+                if getattr(self, "alarm_gpio", None) is not None:
+                    self.alarm_gpio.set_alarm(is_alert)
             else:
                 tracked_results = []
                 mosquito_detections = [
@@ -992,6 +1082,11 @@ class ChamberDetector:
             # 4. Camera release and window cleanup
             self.camera.release()
             cv2.destroyAllWindows()
+
+            # 5. Hardware alarm pin cleanup
+            if getattr(self, "alarm_gpio", None) is not None:
+                self.alarm_gpio.cleanup()
+
             print("[INFO] ChamberDetector shutdown complete.")
 
 if __name__ == "__main__":
